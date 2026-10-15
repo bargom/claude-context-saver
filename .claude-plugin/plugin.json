@@ -1,6 +1,6 @@
 {
   "name": "context-saver",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Shrinks large shell and MCP tool output before Claude reads it, and shows the tokens saved each time.",
   "author": {
     "name": "bargom",
