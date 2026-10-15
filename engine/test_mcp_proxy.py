@@ -181,8 +181,7 @@ asyncio.run(mcp_proxy.http_bridge(sys.argv[2], proxy) if sys.argv[1] == 'http' e
 HELPER_BOOTSTRAP = '''import asyncio, sys
 import mcp_proxy, summary_engine
 def summarize(event):
-    summary_engine.summarize(event['tool_response']['content'][0]['text'], 'search', '', sys.argv[1], 60,
-                             [{'provider': 'claude_cli', 'model': 'sonnet', 'effort': 'low'}])
+    summary_engine.summarize(event['tool_response']['content'][0]['text'], 'search', '', sys.argv[1], 60, 'low')
 try:
     asyncio.run(mcp_proxy.serve(mcp_proxy.Compressor('codebase-memory-mcp', summarize), stdio=sys.argv[2:]))
 except asyncio.CancelledError:

@@ -18,16 +18,10 @@
   ],
   "types": "./types/index.d.ts",
   "userConfig": {
-    "model": {
-      "type": "string",
-      "title": "Summary model",
-      "description": "Claude model that summarizes large output: an alias (sonnet, opus, haiku) or a full model id.",
-      "default": "sonnet"
-    },
     "effort": {
       "type": "string",
       "title": "Summary effort",
-      "description": "Reasoning effort of the summary model; none turns thinking off.",
+      "description": "Reasoning effort of Claude Sonnet when it summarizes large output; none turns thinking off.",
       "options": [
         "none",
         "low",

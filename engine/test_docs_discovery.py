@@ -74,7 +74,6 @@ class DocsDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(row['coverage']['snippet_characters_omitted'], 0)
         self.assertTrue(row['deterministic'])
         self.assertEqual(row['helper_usage']['total_tokens'], 0)
-        self.assertEqual(row['provider_usage'], {})
         self.assertEqual(row['after_tokens'], hook.tokens(text))
         self.assertEqual(row['saved_tokens'], hook.tokens(original['result']['content'][0]['text']) - hook.tokens(text))
         self.assertLessEqual(hook.tokens(text), 1800)

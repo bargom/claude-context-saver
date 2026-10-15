@@ -182,18 +182,18 @@ describe('tool output compression', () => {
 })
 
 describe('options', () => {
-  test('the defaults run Sonnet at medium effort with shell summaries on', async ($, on) => {
+  test('the defaults run medium effort with shell summaries on', async ($, on) => {
     const { calls } = world(on)
     await $.session.start(start)
 
-    expect(calls[0]?.env).toEqual({ CONTEXT_SAVER_MODEL: 'sonnet', CONTEXT_SAVER_EFFORT: 'medium', CONTEXT_SAVER_SUMMARIZE_SHELL: '1' })
+    expect(calls[0]?.env).toEqual({ CONTEXT_SAVER_EFFORT: 'medium', CONTEXT_SAVER_SUMMARIZE_SHELL: '1' })
   })
 
-  test('/config values reach the engine', { options: { model: 'opus', effort: 'none', summarize_shell: false } }, async ($, on) => {
+  test('/config values reach the engine', { options: { effort: 'none', summarize_shell: false } }, async ($, on) => {
     const { calls } = world(on)
     await $.session.start(start)
 
-    expect(calls[0]?.env).toEqual({ CONTEXT_SAVER_MODEL: 'opus', CONTEXT_SAVER_EFFORT: 'none', CONTEXT_SAVER_SUMMARIZE_SHELL: '0' })
+    expect(calls[0]?.env).toEqual({ CONTEXT_SAVER_EFFORT: 'none', CONTEXT_SAVER_SUMMARIZE_SHELL: '0' })
   })
 })
 

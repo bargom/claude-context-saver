@@ -101,12 +101,8 @@ class HookTests(unittest.TestCase):
         self.assertEqual(report['helper_usage']['total_tokens'], 2100)
 
     def test_provider_and_cache_labels_match_complete_payload_ledger(self):
-        cases = [('cursor_cli', 'composer-2.5', False, 'Cursor (composer-2.5)'),
-                 ('cursor_cli', 'composer-2.5', True, 'Cursor (composer-2.5)'),
-                 ('openai_codex', 'gpt-5.6-sol', False, 'Sol'),
-                 ('openai_codex', 'gpt-5.6-sol', True, 'Sol'),
-                 ('claude_cli', 'claude-sonnet-5', False, 'Claude (claude-sonnet-5)'),
-                 ('claude_cli', 'claude-sonnet-5', True, 'Claude (claude-sonnet-5)'),
+        cases = [('claude_cli', 'sonnet', False, 'Claude (sonnet)'),
+                 ('claude_cli', 'sonnet', True, 'Claude (sonnet)'),
                  ('other', 'custom-model', False, 'custom-model'),
                  ('other', None, False, 'other')]
         for provider, model, cached, producer in cases:
@@ -431,7 +427,7 @@ class HookTests(unittest.TestCase):
             path.write_text(json.dumps({'timeout_seconds': 300}))
             self.assertEqual(hook.config()['timeout_seconds'], 300)
             path.write_text(json.dumps({'timeout_seconds': 301}))
-            with self.assertRaises(AssertionError):
+            with self.assertRaisesRegex(ValueError, 'invalid timeout_seconds'):
                 hook.config()
 
     def test_web_classification_does_not_claim_native_transport(self):
@@ -599,8 +595,7 @@ class HookTests(unittest.TestCase):
     def test_stopping_process_ends_the_running_summary_helper(self):
         env, pid_file = fake_claude(self.state)
         (self.state / 'config.json').write_text(json.dumps({'minimum_tokens': 1000, 'deterministic_first': False}))
-        env.update(CONTEXT_SAVER_STATE=str(self.state / 'state'), CONTEXT_SAVER_CONFIG=str(self.state / 'config.json'),
-                   CONTEXT_SAVER_MODEL='sonnet')
+        env.update(CONTEXT_SAVER_STATE=str(self.state / 'state'), CONTEXT_SAVER_CONFIG=str(self.state / 'config.json'))
         with subprocess.Popen([sys.executable, str(hook.ROOT / 'hook.py'), 'process'], env=env, cwd=self.state,
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
             process.stdin.write(json.dumps(self.event()).encode())
@@ -654,54 +649,47 @@ class HookTests(unittest.TestCase):
         self.assertIsNone(hook.session_start())
         self.assertFalse(old.exists())
 
-    def test_debug_flag_must_be_boolean(self):
+    def test_invalid_config_values_are_rejected_by_name(self):
         path = self.state / 'config.json'
-        with patch.object(hook, 'CONFIG_PATH', path):
-            self.assertIs(hook.config()['debug_invalid_responses'], False)
-            path.write_text(json.dumps({'debug_invalid_responses': 'yes'}))
-            with self.assertRaises(AssertionError):
-                hook.config()
+        self.assertIs(hook.config()['debug_invalid_responses'], False)
+        for key, value in [('debug_invalid_responses', 'yes'), ('enabled', 1), ('minimum_tokens', 999),
+                           ('minimum_tokens', 'many'), ('minimum_saving_fraction', 1), ('timeout_seconds', None),
+                           ('effort', 'turbo'), ('effort', None)]:
+            with self.subTest(key=key, value=value):
+                path.write_text(json.dumps({key: value}))
+                with self.assertRaisesRegex(ValueError, f'invalid {key}'):
+                    hook.config()
 
-    def test_provider_accounting_and_cached_credit_rate(self):
-        def backup(**kwargs):
-            return dict(self.engine(), provider='openai_codex', model='gpt-5.6-sol',
-                        per_provider_usage={'openai_codex': {'input_tokens': 2000, 'cache_read_tokens': 1000,
-                                                            'output_tokens': 100, 'total_tokens': 2100}})
-        hook.process(self.event(), self.cfg, backup)
-        report = hook.stats()
-        self.assertEqual(report['per_provider_usage']['openai_codex']['total_tokens'], 2100)
-        self.assertEqual(report['estimated_sol_subscription_credits'], 0.16)
+    def test_config_checks_still_run_under_python_optimize(self):
+        path = self.state / 'config.json'
+        path.write_text(json.dumps({'timeout_seconds': 5000}))
+        result = subprocess.run([sys.executable, '-O', str(hook.ROOT / 'hook.py'), 'limits'], capture_output=True,
+                                text=True, env={**os.environ, 'CONTEXT_SAVER_CONFIG': str(path)})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('invalid timeout_seconds', result.stderr)
 
-    def test_configured_helpers_reach_engine_and_claude_cost_is_reported(self):
+    def test_configured_effort_reaches_engine_and_claude_cost_is_reported(self):
         seen = {}
-        chain = [{'provider': 'claude_cli', 'model': 'claude-sonnet-5', 'effort': 'low'}]
         def engine(**kwargs):
             seen.update(kwargs)
-            sol = {'input_tokens': 2000, 'cache_read_tokens': 1000, 'output_tokens': 100, 'total_tokens': 2100}
-            return dict(self.engine(), provider='claude_cli', model='claude-sonnet-5', list_cost_usd=0.0684,
-                        per_provider_usage={'claude_cli:claude-sonnet-5': dict(sol), 'openai_codex:gpt-5.6-sol': sol})
-        hook.process(self.event(), dict(self.cfg, helpers=chain), engine)
-        self.assertEqual(seen['helpers'], chain)
-        hook.process(self.event('rg -n other src'), self.cfg, lambda **kw: seen.update(default=kw['helpers']) or self.engine())
-        self.assertIsNone(seen['default'])
+            return dict(self.engine(), provider='claude_cli', model='sonnet', list_cost_usd=0.0684)
+        hook.process(self.event(), dict(self.cfg, effort='low'), engine)
+        self.assertEqual(seen['effort'], 'low')
+        hook.process(self.event('rg -n other src'), self.cfg, lambda **kw: seen.update(default=kw['effort']) or self.engine())
+        self.assertEqual(seen['default'], 'medium')
         row = json.loads((self.state / 'events.jsonl').read_text().splitlines()[0])
         self.assertEqual(row['list_cost_usd'], 0.0684)
-        report = hook.stats()
-        self.assertEqual(report['claude_list_price_usd'], 0.0684)
-        self.assertEqual(report['estimated_sol_subscription_credits'], 0.16)
-        self.assertEqual(report['per_provider_usage']['claude_cli:claude-sonnet-5']['total_tokens'], 2100)
+        self.assertEqual((row['provider'], row['model']), ('claude_cli', 'sonnet'))
+        self.assertEqual(hook.stats()['claude_list_price_usd'], 0.0684)
 
-    def test_cursor_usage_and_cache_counts_are_separate_from_sol_credits(self):
+    def test_helper_cache_counts_and_net_savings(self):
         usage = {'input_tokens': 24000, 'output_tokens': 400, 'cache_read_tokens': 18000,
                  'cache_write_tokens': 1000, 'total_tokens': 24400}
-        result = dict(self.engine(), provider='cursor_cli', model='composer-2.5', usage=usage,
-                      per_provider_usage={'cursor_cli': usage})
+        result = dict(self.engine(), provider='claude_cli', model='sonnet', usage=usage)
         hook.process(self.event(), self.cfg, lambda **kwargs: result)
         report = hook.stats()
-        self.assertEqual(report['per_provider_usage']['cursor_cli']['total_tokens'], 24400)
         self.assertEqual(report['helper_usage']['cache_write_tokens'], 1000)
         self.assertEqual(report['helper_usage']['cache_read_tokens'], 18000)
-        self.assertEqual(report['estimated_sol_subscription_credits'], 0)
         self.assertEqual(report['estimated_net_tokens_saved_including_helper'],
                          report['estimated_context_tokens_saved'] - 24400)
 
@@ -728,37 +716,27 @@ class PluginConfigTests(unittest.TestCase):
         self.config_patch.stop()
         self.tmp.cleanup()
 
-    def chain(self, cfg):
-        from summary_engine import normalize_helpers
-        return [(h['provider'], h['model'], h['effort']) for h in normalize_helpers(cfg.get('helpers'))]
-
     def test_without_plugin_options_config_json_decides(self):
-        self.config_path.write_text(json.dumps({'shell_helpers_enabled': False, 'helpers': [
-            {'provider': 'openai_codex', 'model': 'gpt-5.6-sol', 'effort': 'low'}]}))
+        self.config_path.write_text(json.dumps({'shell_helpers_enabled': False, 'effort': 'low'}))
         with patch.dict(os.environ, {}, clear=False):
-            for name in ('CONTEXT_SAVER_MODEL', 'CONTEXT_SAVER_EFFORT', 'CONTEXT_SAVER_SUMMARIZE_SHELL'):
+            for name in ('CONTEXT_SAVER_EFFORT', 'CONTEXT_SAVER_SUMMARIZE_SHELL'):
                 os.environ.pop(name, None)
             cfg = hook.config()
         self.assertFalse(cfg['shell_helpers_enabled'])
-        self.assertEqual(self.chain(cfg), [('openai_codex', 'gpt-5.6-sol', 'low')])
+        self.assertEqual(cfg['effort'], 'low')
+        self.config_path.unlink()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('CONTEXT_SAVER_EFFORT', None)
+            self.assertEqual(hook.config()['effort'], 'medium')
 
-    def test_plugin_model_and_effort_replace_the_first_helper_and_keep_fallbacks(self):
-        self.config_path.write_text(json.dumps({'helpers': [
-            {'provider': 'claude_cli', 'model': 'claude-sonnet-5-5', 'effort': 'medium'},
-            {'provider': 'openai_codex', 'model': 'gpt-5.6-sol', 'effort': 'low'}]}))
-        with patch.dict(os.environ, {'CONTEXT_SAVER_MODEL': 'opus', 'CONTEXT_SAVER_EFFORT': 'high'}):
-            cfg = hook.config()
-        self.assertEqual(self.chain(cfg), [('claude_cli', 'opus', 'high'), ('openai_codex', 'gpt-5.6-sol', 'low')])
-
-    def test_plugin_defaults_alone_give_one_claude_helper(self):
-        with patch.dict(os.environ, {'CONTEXT_SAVER_MODEL': 'sonnet', 'CONTEXT_SAVER_EFFORT': 'medium'}):
-            cfg = hook.config()
-        self.assertEqual(self.chain(cfg), [('claude_cli', 'sonnet', 'medium')])
-
-    def test_effort_none_turns_thinking_off(self):
-        with patch.dict(os.environ, {'CONTEXT_SAVER_MODEL': 'sonnet', 'CONTEXT_SAVER_EFFORT': 'none'}):
-            cfg = hook.config()
-        self.assertEqual(self.chain(cfg), [('claude_cli', 'sonnet', None)])
+    def test_plugin_effort_overrides_config_json(self):
+        self.config_path.write_text(json.dumps({'effort': 'low'}))
+        for effort in ('high', 'none'):
+            with self.subTest(effort=effort), patch.dict(os.environ, {'CONTEXT_SAVER_EFFORT': effort}):
+                self.assertEqual(hook.config()['effort'], effort)
+        with patch.dict(os.environ, {'CONTEXT_SAVER_EFFORT': 'turbo'}), \
+                self.assertRaisesRegex(ValueError, 'invalid effort'):
+            hook.config()
 
     def test_summarize_shell_option_overrides_config_json(self):
         self.config_path.write_text(json.dumps({'shell_helpers_enabled': True}))
@@ -779,12 +757,11 @@ class PluginConfigTests(unittest.TestCase):
         self.assertTrue(state.is_dir())
 
     def test_disable_keeps_the_advanced_settings_in_config_json(self):
-        stored = {'helpers': [{'provider': 'openai_codex', 'model': 'gpt-5.6-sol', 'effort': 'low'}],
-                  'shell_helpers_enabled': False}
+        stored = {'effort': 'low', 'shell_helpers_enabled': False}
         self.config_path.write_text(json.dumps(stored))
         result = subprocess.run([sys.executable, str(hook.ROOT / 'hook.py'), 'disable'], capture_output=True, text=True,
                                 env={**os.environ, 'CONTEXT_SAVER_CONFIG': str(self.config_path),
-                                     'CONTEXT_SAVER_MODEL': 'sonnet', 'CONTEXT_SAVER_SUMMARIZE_SHELL': '1'})
+                                     'CONTEXT_SAVER_EFFORT': 'high', 'CONTEXT_SAVER_SUMMARIZE_SHELL': '1'})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(self.config_path.read_text()), {**stored, 'enabled': False})
 

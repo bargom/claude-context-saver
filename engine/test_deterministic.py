@@ -59,7 +59,6 @@ class DeterministicTests(unittest.TestCase):
         self.assertFalse(row['cache_hit'])
         self.assertFalse(row['usage_incomplete'])
         self.assertEqual(row['helper_usage']['total_tokens'], 0)
-        self.assertEqual(row['provider_usage'], {})
         self.assertEqual(row['after_tokens'], hook.tokens(output))
         self.assertEqual(row['saved_tokens'], hook.tokens(source) - hook.tokens(output))
         self.assertLessEqual(row['after_tokens'], self.cfg['maximum_replacement_tokens'])

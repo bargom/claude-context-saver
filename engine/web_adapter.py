@@ -176,7 +176,7 @@ def provenance_engine(engine, source, records):
         result = engine(**kwargs)
         summary = result.get('summary')
         # Provider failures often carry an empty summary; preserve their original
-        # error, fallback diagnostics, and usage rather than relabeling them.
+        # error and usage rather than relabeling them.
         if result.get('status') not in {'summary', 'cache_hit'} or not summary:
             return result
         if isinstance(summary, str):

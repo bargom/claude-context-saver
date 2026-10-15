@@ -40,8 +40,7 @@ Open `/config` and find the **context-saver** rows, or set them at install time.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| Summary model | `sonnet` | The Claude model that summarizes large output. Use an alias (`sonnet`, `opus`, `haiku`) or a full model id. |
-| Summary effort | `medium` | Reasoning effort of the summary model: `none`, `low`, `medium`, `high`, `xhigh` or `max`. |
+| Summary effort | `medium` | Reasoning effort of Claude Sonnet, the summary model: `none`, `low`, `medium`, `high`, `xhigh` or `max`. |
 | Summarize shell output | on | Send large shell output to the summary model when the local filters cannot make it smaller. Off: shell output gets local filters only. |
 | Toast on each save | off | Also show a toast for each compressed result. The transcript line always shows. |
 
@@ -52,7 +51,7 @@ A change in `/config` applies at once.
 ```
 /context-saver                 savings of the last 7 days
 /context-saver stats 30        savings of the last 30 days
-/context-saver status          active settings, helper chain and file locations
+/context-saver status          active settings, summary model and file locations
 /context-saver disable         stop compressing (enable turns it on again)
 /context-saver setup           rebuild the Python environment
 /context-saver review <note>   record that you checked summary quality
@@ -69,7 +68,7 @@ CONTEXT_SAVER_RAW=1 rg -n handler src
 1. The plugin's mod watches every Bash and MCP tool call. The tool runs as usual, with your permission rules, sandbox, timeouts and streaming.
 2. When the output is large (3,500 tokens by default), the mod gives the complete output to the engine (`engine/hook.py`).
 3. The engine tries local filters first. These keep every identity and line number of known search results, drop passing tests from Jest, Vitest, pytest and Cargo reports, and use RTK when it is installed.
-4. When the local filters are not enough, the summary model writes a short, factual summary. It runs as `claude -p` with your normal Claude login, with no tools, no hooks, no MCP servers and no session files.
+4. When the local filters are not enough, Claude Sonnet writes a short, factual summary. It runs as `claude -p` with your normal Claude login, with no tools, no hooks, no MCP servers and no session files.
 5. The mod replaces the output with the result, writes the savings line, and updates the session total.
 
 Claude Code saves Bash output over 30,000 characters to a file and shows Claude only a short preview. For such output Claude gets the summary in place of that preview, and the savings line says `vs full output`: the count is against the complete output, not against the preview.
@@ -104,7 +103,7 @@ Summaries use your Claude subscription or API login, like any other `claude -p` 
 
 Copy `config.example.json` to `~/.config/context-saver/config.json` and change what you need. The `/config` settings above always win over this file.
 
-- `helpers`: an ordered chain of up to 4 summary helpers. The `/config` model and effort replace the first entry. Later entries run only when an earlier one hits a capacity limit or a timeout. Providers: `claude_cli` (Claude Code), `openai_codex` (`codex exec`) and `cursor_cli` (Cursor's `agent`).
+- `effort`: the Sonnet effort when no `/config` value is set, for example under Codex.
 - `minimum_tokens`, `maximum_replacement_tokens`, `minimum_saving_fraction`: when a result is worth compressing.
 - `categories`: which kinds of output to compress (`search`, `logs`, `git`, `documentation`).
 - `rtk_enabled`, `rtk_binary`: the RTK stage (an empty `rtk_binary` means `rtk` on `PATH`).

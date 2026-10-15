@@ -39,7 +39,7 @@ setup() {
   fi
   mkdir -p "$DATA" "$TIKTOKEN_CACHE_DIR"
   "$base" -m venv "$VENV"
-  "$VENV/bin/python" -m pip install --quiet --disable-pip-version-check -r "$REQUIREMENTS"
+  "$VENV/bin/python" -m pip install --quiet --disable-pip-version-check --require-hashes -r "$REQUIREMENTS"
   "$VENV/bin/python" -c "import tiktoken; tiktoken.get_encoding('o200k_base')"
   cp "$REQUIREMENTS" "$VENV/requirements.txt"
   echo "context-saver: Python environment ready in $VENV"

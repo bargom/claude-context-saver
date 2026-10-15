@@ -128,18 +128,15 @@ class WebAdapterTests(unittest.TestCase):
         self.assertEqual(self.ledger()[-1]['status'], 'adapter_failed')
 
     def test_empty_provider_failure_preserves_original_error_and_usage(self):
-        original = {'status': 'error', 'summary': '', 'error': 'model_timeout',
-                    'primary_error': 'model_timeout', 'elapsed_ms': 60342,
+        original = {'status': 'error', 'summary': '', 'error': 'model_timeout', 'elapsed_ms': 60342,
                     'usage': {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0},
-                    'per_provider_usage': {'google_antigravity': {'total_tokens': 0}},
-                    'usage_incomplete': True, 'diagnostic_file': '/private/original-error.txt'}
+                    'usage_incomplete': True}
         self.engine.return_value = original
         checked = web_adapter.provenance_engine(self.engine, self.source, web_adapter.source_records(self.source))
         self.assertIs(checked(state_dir=self.state / 'engine'), original)
         self.assertFalse(self.transform(self.event())['compressed'])
         row = self.ledger()[-1]
         self.assertEqual(row['error'], 'model_timeout')
-        self.assertEqual(row['primary_error'], 'model_timeout')
         self.assertEqual(row['latency_ms'], 60342)
         self.assertEqual(row['helper_usage'], original['usage'])
         self.assertEqual(row['saved_tokens'], 0)
@@ -269,7 +266,7 @@ class WebAdapterTests(unittest.TestCase):
         unknown = 'The full content of citeturn5view1 is truncated (citeturn5view1).'
         original = {'status': 'cache_hit', 'summary': '- ' + fact + '\n- Unknown: ' + unknown,
                     'facts': [fact], 'unknowns': [unknown], 'usage': {'input_tokens': 8000, 'output_tokens': 200},
-                    'elapsed_ms': 4679, 'cache_hit': True, 'provider': 'google_antigravity'}
+                    'elapsed_ms': 4679, 'cache_hit': True, 'provider': 'claude_cli', 'model': 'sonnet'}
         self.engine.return_value = original
         checked = web_adapter.provenance_engine(self.engine, source, web_adapter.source_records(source))
         result = checked(state_dir=self.state / 'engine')

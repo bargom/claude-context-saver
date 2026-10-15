@@ -13,8 +13,5 @@
   "review_every_days": 7,
   "debug_invalid_responses": false,
   "categories": ["search", "logs", "git", "documentation"],
-  "helpers": [
-    { "provider": "claude_cli", "model": "sonnet", "effort": "medium" },
-    { "provider": "openai_codex", "model": "gpt-5.6-sol", "effort": "low" }
-  ]
+  "effort": "medium"
 }

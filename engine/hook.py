@@ -16,14 +16,16 @@ import sys
 import tempfile
 import time
 
+from summary_engine import DEFAULT_EFFORT, EFFORTS, MODEL, PROVIDER
+
 ROOT = Path(__file__).resolve().parent
 STATE = Path(os.environ.get('CONTEXT_SAVER_STATE') or Path.home() / '.cache/context-saver')
 CONFIG_PATH = Path(os.environ.get('CONTEXT_SAVER_CONFIG') or
                    Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'context-saver/config.json')
 # Set by the Claude Code plugin from its /config options; they override config.json.
-MODEL_ENV, EFFORT_ENV, SHELL_ENV = 'CONTEXT_SAVER_MODEL', 'CONTEXT_SAVER_EFFORT', 'CONTEXT_SAVER_SUMMARIZE_SHELL'
+EFFORT_ENV, SHELL_ENV = 'CONTEXT_SAVER_EFFORT', 'CONTEXT_SAVER_SUMMARIZE_SHELL'
 DEFAULTS = {
-    'shell_helpers_enabled': True, 'debug_invalid_responses': False,
+    'effort': DEFAULT_EFFORT, 'shell_helpers_enabled': True, 'debug_invalid_responses': False,
     # An empty rtk_binary resolves `rtk` on PATH; a missing binary skips the RTK stage.
     'rtk_enabled': True, 'rtk_binary': '',
     'enabled': True, 'deterministic_first': True, 'minimum_tokens': 3500, 'maximum_source_chars': 60000,
@@ -62,37 +64,38 @@ def save_json(path, value):
     os.replace(temporary, path)
 
 
-def plugin_helpers(configured):
-    """The plugin's model/effort options become the first helper; config.json
-    `helpers` entries after it stay as capacity/timeout fallbacks."""
-    model = os.environ.get(MODEL_ENV, '').strip()
-    if not model:
-        return configured
-    effort = os.environ.get(EFFORT_ENV, '').strip() or 'medium'
-    primary = {'provider': 'claude_cli', 'model': model, 'effort': None if effort == 'none' else effort}
-    fallbacks = [x for x in (configured or [])[1:] if not isinstance(x, dict) or
-                 (x.get('provider'), x.get('model')) != ('claude_cli', model)]
-    return [primary, *fallbacks]
+def is_flag(value):
+    return isinstance(value, bool)
+
+
+# What config() accepts for each key, from config.json or the plugin options.
+VALID = {
+    'enabled': is_flag, 'deterministic_first': is_flag, 'rtk_enabled': is_flag,
+    'shell_helpers_enabled': is_flag, 'debug_invalid_responses': is_flag,
+    'minimum_tokens': lambda x: 1000 <= int(x) <= 50000,
+    'maximum_source_chars': lambda x: 1000 <= int(x) <= 60000,
+    'maximum_replacement_tokens': lambda x: 200 <= int(x) <= 2000,
+    'minimum_saving_fraction': lambda x: .1 <= float(x) < 1,
+    'timeout_seconds': lambda x: 5 <= int(x) <= 300,
+    'effort': lambda x: x in EFFORTS,
+}
 
 
 def config():
     value = dict(DEFAULTS)
     if CONFIG_PATH.exists():
         value.update(json.loads(CONFIG_PATH.read_text()))
-    if os.environ.get(MODEL_ENV, '').strip():
-        value['helpers'] = plugin_helpers(value.get('helpers'))
+    if os.environ.get(EFFORT_ENV, '').strip():
+        value['effort'] = os.environ[EFFORT_ENV].strip()
     if os.environ.get(SHELL_ENV) in ('0', '1'):
         value['shell_helpers_enabled'] = os.environ[SHELL_ENV] == '1'
-    assert isinstance(value['enabled'], bool)
-    assert isinstance(value['deterministic_first'], bool)
-    assert isinstance(value['rtk_enabled'], bool)
-    assert isinstance(value['shell_helpers_enabled'], bool)
-    assert isinstance(value['debug_invalid_responses'], bool)
-    assert 1000 <= int(value['minimum_tokens']) <= 50000
-    assert 1000 <= int(value['maximum_source_chars']) <= 60000
-    assert 200 <= int(value['maximum_replacement_tokens']) <= 2000
-    assert .1 <= float(value['minimum_saving_fraction']) < 1
-    assert 5 <= int(value['timeout_seconds']) <= 300
+    for key, valid in VALID.items():
+        try:
+            ok = valid(value[key])
+        except (TypeError, ValueError):
+            ok = False
+        if not ok:
+            raise ValueError(f'context-saver config: invalid {key} {value[key]!r:.80}')
     return value
 
 
@@ -571,16 +574,11 @@ def exact_diagnostics(text, metadata):
 
 def label_savings(replacement, before, result):
     """Budget the visible label itself; return only a consistent token count."""
-    provider = result.get('provider') or 'helper'
     model = result.get('model') or ''
-    if provider == 'cursor_cli':
-        producer = f'Cursor ({model})' if model else 'Cursor'
-    elif provider == 'openai_codex' and 'sol' in model.lower():
-        producer = 'Sol'
-    elif provider == 'claude_cli':
+    if result.get('provider') == PROVIDER:
         producer = f'Claude ({model})' if model else 'Claude'
     else:
-        producer = model or provider or 'helper'
+        producer = model or result.get('provider') or 'helper'
     if result.get('local_compaction'):
         producer = ('RTK (local)' if model == 'rtk-stdin-filter' else 'local compaction') if result.get('local_only') else producer + ' + local compaction'
     cached = '; cache hit' if result.get('cache_hit') or result.get('status') == 'cache_hit' else ''
@@ -671,7 +669,7 @@ def process(event, cfg=None, engine=None, *, output_suffix=''):
                        'complete_diagnostics': candidate['kind'] == 'jest_success_filter',
                        'usage': dict.fromkeys(('input_tokens', 'output_tokens', 'thinking_tokens',
                                               'cache_read_tokens', 'cache_write_tokens', 'total_tokens'), 0),
-                       'per_provider_usage': {}, 'elapsed_ms': 0, 'usage_incomplete': False}
+                       'elapsed_ms': 0, 'usage_incomplete': False}
             labelled = render_replacement(text, before, category, metadata, raw, current, output_suffix)
             if (labelled is not None and labelled[1] <= cfg['maximum_replacement_tokens'] and
                     labelled[2] / before >= cfg['minimum_saving_fraction']):
@@ -725,7 +723,7 @@ def process(event, cfg=None, engine=None, *, output_suffix=''):
                 try:
                     result = engine(text=helper_text, category=category, context=context,
                                     state_dir=STATE / 'engine', timeout_seconds=cfg['timeout_seconds'],
-                                    helpers=cfg.get('helpers'))
+                                    effort=cfg['effort'])
                 except Exception as exc:
                     if not prepared:
                         raise
@@ -739,8 +737,7 @@ def process(event, cfg=None, engine=None, *, output_suffix=''):
     base.update({'helper_usage': usage, 'cache_hit': bool(result.get('cache_hit') or result.get('status') == 'cache_hit'), 'latency_ms': result.get('elapsed_ms', 0),
                  'provider': result.get('provider') or 'unknown', 'model': result.get('model'),
                  'observed_model': result.get('observed_model'),
-                 'provider_usage': result.get('per_provider_usage', {}),
-                 'primary_error': result.get('primary_error'), 'usage_incomplete': bool(result.get('usage_incomplete')),
+                 'usage_incomplete': bool(result.get('usage_incomplete')),
                  **({'list_cost_usd': result['list_cost_usd']} if 'list_cost_usd' in result else {}),
                  **({'fallback_reason': result.get('fallback_reason')} if prepared else {})})
     if result.get('status') not in ['summary', 'cache_hit'] or not result.get('summary'):
@@ -808,33 +805,20 @@ def stats(days=None):
     statuses = {}
     for row in rows:
         statuses[row['status']] = statuses.get(row['status'], 0) + 1
-    providers = {}
-    for row in rows:
-        for provider, values in (row.get('provider_usage') or {}).items():
-            summed = providers.setdefault(provider, dict.fromkeys(usage, 0))
-            for key in summed:
-                summed[key] += int(values.get(key, 0))
-    # Keys are "provider:model" (older ledger rows: bare provider names).
-    sol = {key: sum(int(values.get(key, 0)) for name, values in providers.items()
-                    if name.split(':')[0] == 'openai_codex') for key in usage}
     rtk_rows = [x for x in compressed if x.get('model') == 'rtk-stdin-filter']
-    cached = min(sol.get('input_tokens', 0), sol.get('cache_read_tokens', 0))
-    sol_credits = ((sol.get('input_tokens', 0) - cached) * 100 + cached * 10 + sol.get('output_tokens', 0) * 500) / 1000000
     return {'period_days': days, 'events': len(rows), 'compressed_outputs': len(compressed),
             'cache_hits': sum(bool(x.get('cache_hit')) for x in compressed), 'statuses': statuses,
             'estimated_before_tokens': before, 'estimated_after_tokens': after,
             'estimated_context_tokens_saved': before - after,
             'estimated_context_reduction_percent': round(100 * (before - after) / before, 4) if before else 0,
-            'helper_usage': usage, 'per_provider_usage': providers,
+            'helper_usage': usage,
             'rtk': {'compressed_outputs': len(rtk_rows),
                     'estimated_context_tokens_saved': sum(x['saved_tokens'] for x in rtk_rows),
                     'helper_tokens': 0},
             'usage_incomplete_events': sum(bool(x.get('usage_incomplete')) for x in rows),
-            'estimated_sol_subscription_credits': sol_credits,
             'claude_list_price_usd': round(sum(float(x.get('list_cost_usd', 0)) for x in rows), 6),
-            'sol_credit_rate_checked': '2026-09-12; https://learn.chatgpt.com/docs/pricing',
             'estimated_net_tokens_saved_including_helper': before - after - usage['total_tokens'],
-            'tokenizer': 'o200k_base', 'billing': 'Claude uses the Claude Code subscription login (claude_list_price_usd is the CLI list-price equivalent, not a charge); Cursor account allowance; Sol uses Codex subscription',
+            'tokenizer': 'o200k_base', 'billing': 'Claude uses the Claude Code subscription login (claude_list_price_usd is the CLI list-price equivalent, not a charge)',
             'limits': 'Payload estimate only; excludes main-model reasoning, repeated context, follow-up reads and account credit deductions.'}
 
 
@@ -910,16 +894,8 @@ def main():
     elif args.action == 'stats':
         print(json.dumps(stats(args.days), indent=2))
     elif args.action == 'status':
-        from summary_engine import normalize_helpers, RETRYABLE_ERRORS
         cfg = config()
-        try:
-            chain = list(normalize_helpers(cfg.get('helpers')))
-        except ValueError as exc:
-            chain = f'{exc}: helpers must be 1-4 unique {{provider, model, effort}} entries'
-        print(json.dumps({'config': cfg, 'helpers': chain,
-                          'helpers_source': ('plugin options' if os.environ.get(MODEL_ENV, '').strip() else
-                                             'config.json' if 'helpers' in cfg else 'summary_engine.DEFAULT_HELPERS'),
-                          'fallback_triggers': list(RETRYABLE_ERRORS),
+        print(json.dumps({'config': cfg, 'summary_model': f"Claude ({MODEL}), effort {cfg['effort']}",
                           'state': str(STATE), 'config_path': str(CONFIG_PATH), 'python': sys.executable}, indent=2))
     elif args.action in ['enable', 'disable']:
         # Only the switch changes: plugin options in the environment and

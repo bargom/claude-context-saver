@@ -18,7 +18,6 @@ type Dollar = EngineInterface
 /** The /config options as the engine reads them (engine/hook.py config()). */
 function engineEnv(options: PluginOptions): Record<string, string> {
   return {
-    CONTEXT_SAVER_MODEL: String(options.model ?? 'sonnet'),
     CONTEXT_SAVER_EFFORT: String(options.effort ?? 'medium'),
     CONTEXT_SAVER_SUMMARIZE_SHELL: options.summarize_shell === false ? '0' : '1',
   }
