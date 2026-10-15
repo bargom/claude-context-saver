@@ -1,0 +1,62 @@
+#!/bin/sh
+# context-saver: runs the compression engine in its own Python venv.
+#   setup   (re)creates the venv from engine/requirements.txt
+#   ensure  runs setup only when the venv is missing or out of date
+#   mcp-proxy  runs engine/mcp_proxy.py (optional MCP transport wrapper)
+#   web-adapter  runs engine/web_adapter.py (Codex web bridge, see web-bridge)
+#   *       everything else goes to engine/hook.py (process, stats, status,
+#           enable, disable, review, session-start, web-bridge, pre-tool, run)
+set -eu
+
+self=$0
+# Follow links (a copy linked into ~/.local/bin) back to the plugin folder.
+while [ -L "$self" ]; do
+  link=$(readlink "$self")
+  case $link in
+    /*) self=$link ;;
+    *) self=$(dirname "$self")/$link ;;
+  esac
+done
+ROOT=$(cd "$(dirname "$self")/.." && pwd -P)
+DATA=${CONTEXT_SAVER_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/context-saver}
+VENV=$DATA/venv
+PYTHON=${CONTEXT_SAVER_PYTHON:-$VENV/bin/python}
+REQUIREMENTS=$ROOT/engine/requirements.txt
+# tiktoken downloads its encoding once; keep it out of the temp folder.
+TIKTOKEN_CACHE_DIR=${TIKTOKEN_CACHE_DIR:-$DATA/tiktoken}
+export TIKTOKEN_CACHE_DIR
+
+ready() {
+  [ -x "$PYTHON" ] || return 1
+  [ -n "${CONTEXT_SAVER_PYTHON:-}" ] || cmp -s "$REQUIREMENTS" "$VENV/requirements.txt"
+}
+
+setup() {
+  base=${CONTEXT_SAVER_BASE_PYTHON:-python3}
+  if ! "$base" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
+    echo "context-saver: needs Python 3.10 or newer as '$base'" >&2
+    exit 2
+  fi
+  mkdir -p "$DATA" "$TIKTOKEN_CACHE_DIR"
+  "$base" -m venv "$VENV"
+  "$VENV/bin/python" -m pip install --quiet --disable-pip-version-check -r "$REQUIREMENTS"
+  "$VENV/bin/python" -c "import tiktoken; tiktoken.get_encoding('o200k_base')"
+  cp "$REQUIREMENTS" "$VENV/requirements.txt"
+  echo "context-saver: Python environment ready in $VENV"
+}
+
+case ${1:-} in
+  setup) setup ;;
+  ensure) ready || setup ;;
+  *)
+    if ! ready; then
+      echo "context-saver: Python environment missing or out of date; run: $self setup" >&2
+      exit 3
+    fi
+    case ${1:-} in
+      mcp-proxy) shift; exec "$PYTHON" "$ROOT/engine/mcp_proxy.py" "$@" ;;
+      web-adapter) shift; exec "$PYTHON" "$ROOT/engine/web_adapter.py" "$@" ;;
+    esac
+    exec "$PYTHON" "$ROOT/engine/hook.py" "$@"
+    ;;
+esac

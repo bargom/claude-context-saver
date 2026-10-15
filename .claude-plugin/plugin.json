@@ -1,0 +1,54 @@
+{
+  "name": "context-saver",
+  "version": "0.1.0",
+  "description": "Shrinks large shell and MCP tool output before Claude reads it, and shows the tokens saved each time.",
+  "author": {
+    "name": "bargom",
+    "url": "https://github.com/bargom"
+  },
+  "homepage": "https://github.com/bargom/claude-context-saver",
+  "repository": "https://github.com/bargom/claude-context-saver",
+  "license": "MIT",
+  "keywords": [
+    "context",
+    "tokens",
+    "compression",
+    "hooks",
+    "rtk"
+  ],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "model": {
+      "type": "string",
+      "title": "Summary model",
+      "description": "Claude model that summarizes large output: an alias (sonnet, opus, haiku) or a full model id.",
+      "default": "sonnet"
+    },
+    "effort": {
+      "type": "string",
+      "title": "Summary effort",
+      "description": "Reasoning effort of the summary model; none turns thinking off.",
+      "options": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default": "medium"
+    },
+    "summarize_shell": {
+      "type": "boolean",
+      "title": "Summarize shell output",
+      "description": "Send large shell output (search, git, test and build logs) to the summary model when the local filters cannot shrink it.",
+      "default": true
+    },
+    "toast": {
+      "type": "boolean",
+      "title": "Toast on each save",
+      "description": "Also pop a toast for each compressed result; the transcript line always shows.",
+      "default": false
+    }
+  }
+}

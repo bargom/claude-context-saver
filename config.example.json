@@ -1,0 +1,20 @@
+{
+  "enabled": true,
+  "shell_helpers_enabled": true,
+  "deterministic_first": true,
+  "rtk_enabled": true,
+  "rtk_binary": "",
+  "minimum_tokens": 3500,
+  "maximum_source_chars": 60000,
+  "maximum_replacement_tokens": 1800,
+  "minimum_saving_fraction": 0.3,
+  "timeout_seconds": 300,
+  "retention_days": 7,
+  "review_every_days": 7,
+  "debug_invalid_responses": false,
+  "categories": ["search", "logs", "git", "documentation"],
+  "helpers": [
+    { "provider": "claude_cli", "model": "sonnet", "effort": "medium" },
+    { "provider": "openai_codex", "model": "gpt-5.6-sol", "effort": "low" }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "name": "context-saver",
+  "owner": {
+    "name": "bargom"
+  },
+  "plugins": [
+    {
+      "name": "context-saver",
+      "source": "./",
+      "description": "Shrinks large shell and MCP tool output before Claude reads it, and shows the tokens saved each time."
+    }
+  ],
+  "description": "The context-saver plugin for Claude Code."
+}
