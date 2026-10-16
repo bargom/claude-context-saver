@@ -65,15 +65,21 @@ CONTEXT_SAVER_RAW=1 rg -n handler src
 
 ## How it works
 
+![The parts: Claude Code, the tool.call hook, the bin/context-saver launcher, the Python engine with its local filters, summary cache and archive, and Claude Sonnet](docs/how-it-works-parts.png)
+
 1. The plugin's mod watches every Bash and MCP tool call. The tool runs as usual, with your permission rules, sandbox, timeouts and streaming.
 2. When the output is large (3,500 tokens by default), the mod gives the complete output to the engine (`engine/hook.py`).
 3. The engine tries local filters first. These keep every identity and line number of known search results, drop passing tests from Jest, Vitest, pytest and Cargo reports, and use RTK when it is installed.
 4. When the local filters are not enough, Claude Sonnet writes a short, factual summary. It runs as `claude -p` with your normal Claude login, with no tools, no hooks, no MCP servers and no session files.
 5. The mod replaces the output with the result, writes the savings line, and updates the session total.
 
+![One large search in time order: Claude asks for a Bash search, the hook lets the command run, the engine asks Claude Sonnet, and Claude gets the summary with the path of the original](docs/how-it-works-sequence.png)
+
 Claude Code saves Bash output over 30,000 characters to a file and shows Claude only a short preview. For such output Claude gets the summary in place of that preview, and the savings line says `vs full output`: the count is against the complete output, not against the preview.
 
 The model always sees where the original is. The engine keeps the complete original in a private archive and names the file in the result, so Claude can read the exact text when it needs details.
+
+![Which output gets shorter: the size and safety checks, the local filters, the budget, the Sonnet summary, and the path that keeps the original](docs/how-it-works-checks.png)
 
 The engine leaves the output unchanged when:
 
