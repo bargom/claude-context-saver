@@ -1,11 +1,19 @@
 #!/bin/sh
 # context-saver: runs the compression engine in its own Python venv.
-#   setup   (re)creates the venv from engine/requirements.txt
-#   ensure  runs setup only when the venv is missing or out of date
+#   setup [--mcp]  builds the venv for engine/requirements.txt (one venv per
+#                  requirements hash); --mcp adds the MCP SDK that
+#                  `mcp-proxy --http` needs (engine/requirements-mcp.txt)
+#   ensure         setup, unless the venv is ready
+#   ensure --background  never waits: 0 ready, 75 setup running (started now
+#                  or earlier), 1 setup failed in the last 10 minutes
 #   mcp-proxy  runs engine/mcp_proxy.py (optional MCP transport wrapper)
 #   web-adapter  runs engine/web_adapter.py (Codex web bridge, see web-bridge)
 #   *       everything else goes to engine/hook.py (process, stats, status,
-#           enable, disable, review, session-start, web-bridge, pre-tool, run)
+#           enable, disable, review, session-start, web-bridge, pre-tool, run,
+#           delivered)
+# Before the venv is ready, the hook actions start the setup in the background
+# and step aside: hooks exit 0, `run` runs its command directly and
+# `mcp-proxy --stdio` runs the wrapped server directly.
 set -eu
 
 self=$0
@@ -18,45 +26,293 @@ while [ -L "$self" ]; do
   esac
 done
 ROOT=$(cd "$(dirname "$self")/.." && pwd -P)
+self=$ROOT/bin/${self##*/}
 DATA=${CONTEXT_SAVER_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/context-saver}
-VENV=$DATA/venv
-PYTHON=${CONTEXT_SAVER_PYTHON:-$VENV/bin/python}
 REQUIREMENTS=$ROOT/engine/requirements.txt
+MCP_REQUIREMENTS=$ROOT/engine/requirements-mcp.txt
+LOCK=$DATA/setup.lock
+FAILED=$DATA/setup-failed
+LOG=$DATA/setup.log
 # tiktoken downloads its encoding once; keep it out of the temp folder.
 TIKTOKEN_CACHE_DIR=${TIKTOKEN_CACHE_DIR:-$DATA/tiktoken}
 export TIKTOKEN_CACHE_DIR
 
+# First 12 hex digits of a file's SHA-256.
+digest() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sum=$(sha256sum < "$1")
+  elif command -v shasum >/dev/null 2>&1; then
+    sum=$(shasum -a 256 < "$1")
+  else
+    echo "context-saver: needs sha256sum or shasum" >&2
+    exit 2
+  fi
+  printf '%.12s\n' "$sum"
+}
+
+# A new requirements file gets a new venv, so copies of the plugin on
+# different versions (Claude Code cache, Codex clone) never break each other.
+VENV=$DATA/venv-$(digest "$REQUIREMENTS")
+PYTHON=${CONTEXT_SAVER_PYTHON:-$VENV/bin/python}
+
 ready() {
   [ -x "$PYTHON" ] || return 1
-  [ -n "${CONTEXT_SAVER_PYTHON:-}" ] || cmp -s "$REQUIREMENTS" "$VENV/requirements.txt"
+  [ -n "${CONTEXT_SAVER_PYTHON:-}" ] || [ -f "$VENV/.ready" ]
+}
+
+venv_ready() {
+  [ -x "$VENV/bin/python" ] && [ -f "$VENV/.ready" ]
+}
+
+mcp_stamp() {
+  echo "$VENV/.mcp-$(digest "$MCP_REQUIREMENTS")"
+}
+
+# The MCP SDK is in the venv (a CONTEXT_SAVER_PYTHON override is trusted;
+# mcp_proxy reports a missing SDK itself).
+mcp_ready() {
+  [ -n "${CONTEXT_SAVER_PYTHON:-}" ] || [ -f "$(mcp_stamp)" ]
+}
+
+# Marks the venv as used, so setups of other versions do not prune it.
+touch_ready() {
+  if [ -f "$VENV/.ready" ]; then touch "$VENV/.ready" 2>/dev/null || :; fi
+}
+
+lock_stale() {
+  [ -n "$(find "$LOCK" -prune -mmin +20 2>/dev/null)" ]
+}
+
+lock_held() {
+  [ -d "$LOCK" ] && ! lock_stale
+}
+
+failed_recently() {
+  [ -n "$(find "$FAILED" -prune -mmin -10 2>/dev/null)" ]
+}
+
+# Starts the setup fully detached from the caller (its own log, no shared
+# pipes), unless one is running or one failed in the last 10 minutes; $1 may
+# be --mcp. Returns 0 when a setup is running now, 1 after a recent failure.
+start_setup() {
+  lock_held && return 0
+  failed_recently && return 1
+  mkdir -p "$DATA" 2>/dev/null || return 1
+  nohup sh "$self" setup ${1:+"$1"} </dev/null >"$LOG" 2>&1 &
+  return 0
+}
+
+# Takes the setup lock (a folder); waits up to 600 s for another setup and
+# breaks a lock older than 20 minutes. Released on every exit.
+take_lock() {
+  waited=0
+  until mkdir "$LOCK" 2>/dev/null; do
+    if [ ! -d "$LOCK" ]; then
+      echo "context-saver: cannot create $LOCK" >&2
+      exit 1
+    fi
+    if lock_stale; then
+      rmdir "$LOCK" 2>/dev/null || :
+      continue
+    fi
+    if [ "$waited" -ge 600 ]; then
+      echo "context-saver: another setup is still running ($LOCK); try again later" >&2
+      exit 75
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  locked=1
+}
+
+cleanup() {
+  if [ -n "${partial:-}" ] && [ -d "$partial" ]; then rm -rf -- "${partial:?}"; fi
+  if [ -n "${errors:-}" ]; then rm -f -- "$errors"; fi
+  if [ -n "${locked:-}" ]; then rmdir "$LOCK" 2>/dev/null || :; fi
+}
+
+# Writes setup-failed (message + error tail) for `ensure --background`, shows
+# the errors, and exits with $1.
+fail() {
+  code=$1
+  shift
+  {
+    printf 'context-saver setup failed at %s: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
+    if [ -s "$errors" ]; then tail -n 20 "$errors"; fi
+  } > "$FAILED.$$" 2>/dev/null && mv -f "$FAILED.$$" "$FAILED" || :
+  if [ -s "$errors" ]; then cat "$errors" >&2; fi
+  echo "context-saver: setup failed: $*" >&2
+  exit "$code"
+}
+
+pip_install() {
+  # Never a venv console script: their shebangs keep the .partial path.
+  "$1/bin/python" -m pip install --quiet --disable-pip-version-check --require-hashes -r "$2"
+}
+
+# Removes venvs of other requirements unused for 30 days, and leftovers of
+# setups that stopped half-way.
+prune() {
+  for dir in "$DATA"/venv-*; do
+    [ -d "$dir" ] && [ "$dir" != "$VENV" ] || continue
+    case $dir in
+      *.partial-*|*.stale-*) old=$(find "$dir" -prune -mmin +60 2>/dev/null) ;;
+      *) old=$(find "$dir/.ready" -prune -mtime +30 2>/dev/null) ;;
+    esac
+    if [ -n "$old" ]; then rm -rf -- "${dir:?}"; fi
+  done
 }
 
 setup() {
-  base=${CONTEXT_SAVER_BASE_PYTHON:-python3}
-  if ! "$base" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
-    echo "context-saver: needs Python 3.10 or newer as '$base'" >&2
-    exit 2
-  fi
+  mcp=$1
+  # Once asked for, the MCP SDK comes with every later venv too, so a new
+  # requirements file never takes the HTTP proxy away.
+  if [ -f "$DATA/mcp-wanted" ]; then mcp=1; fi
   mkdir -p "$DATA" "$TIKTOKEN_CACHE_DIR"
-  "$base" -m venv "$VENV"
-  "$VENV/bin/python" -m pip install --quiet --disable-pip-version-check --require-hashes -r "$REQUIREMENTS"
-  "$VENV/bin/python" -c "import tiktoken; tiktoken.get_encoding('o200k_base')"
-  cp "$REQUIREMENTS" "$VENV/requirements.txt"
+  trap cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  take_lock
+  errors=$DATA/setup-errors.$$
+  : > "$errors"
+  if ! venv_ready; then
+    base=${CONTEXT_SAVER_BASE_PYTHON:-python3}
+    if ! "$base" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>>"$errors"; then
+      fail 2 "needs Python 3.10 or newer as '$base'"
+    fi
+    # Built aside and moved in whole: no reader ever sees half a venv.
+    partial=$VENV.partial-$$
+    "$base" -m venv "$partial" 2>>"$errors" || fail 1 "could not create the venv"
+    pip_install "$partial" "$REQUIREMENTS" 2>>"$errors" || fail 1 "could not install engine/requirements.txt"
+    if [ "$mcp" = 1 ]; then
+      pip_install "$partial" "$MCP_REQUIREMENTS" 2>>"$errors" || fail 1 "could not install engine/requirements-mcp.txt"
+    fi
+    "$partial/bin/python" -c "import tiktoken; tiktoken.get_encoding('o200k_base')" 2>>"$errors" ||
+      fail 1 "could not load the tiktoken encoding"
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$partial/.ready"
+    if [ "$mcp" = 1 ]; then : > "$partial/$(basename "$(mcp_stamp)")"; fi
+    # A venv left without .ready (or with a broken python) is replaced.
+    if [ -e "$VENV" ]; then mv "$VENV" "$VENV.stale-$$"; fi
+    mv "$partial" "$VENV" || fail 1 "could not move the venv into place"
+    partial=
+    if [ -e "$VENV.stale-$$" ]; then rm -rf -- "${VENV:?}.stale-$$"; fi
+  elif [ "$mcp" = 1 ] && [ ! -f "$(mcp_stamp)" ]; then
+    pip_install "$VENV" "$MCP_REQUIREMENTS" 2>>"$errors" || fail 1 "could not install engine/requirements-mcp.txt"
+    : > "$(mcp_stamp)"
+  fi
+  touch_ready
+  if [ "$mcp" = 1 ]; then : > "$DATA/mcp-wanted"; fi
+  rm -f -- "$FAILED"
+  prune
   echo "context-saver: Python environment ready in $VENV"
 }
 
-case ${1:-} in
-  setup) setup ;;
-  ensure) ready || setup ;;
-  *)
-    if ! ready; then
-      echo "context-saver: Python environment missing or out of date; run: $self setup" >&2
-      exit 3
-    fi
-    case ${1:-} in
-      mcp-proxy) shift; exec "$PYTHON" "$ROOT/engine/mcp_proxy.py" "$@" ;;
-      web-adapter) shift; exec "$PYTHON" "$ROOT/engine/web_adapter.py" "$@" ;;
+action=${1:-}
+case $action in
+  setup)
+    case ${2:-} in
+      '') setup 0 ;;
+      --mcp) setup 1 ;;
+      *) echo "usage: $self setup [--mcp]" >&2; exit 2 ;;
     esac
-    exec "$PYTHON" "$ROOT/engine/hook.py" "$@"
+    ;;
+  ensure)
+    case ${2:-} in
+      '')
+        if ready; then touch_ready; else setup 0; fi
+        ;;
+      --background)
+        if ready; then
+          touch_ready
+          exit 0
+        fi
+        if start_setup; then
+          echo "context-saver: setting up the Python environment in the background (log: $LOG)"
+          exit 75
+        fi
+        if [ -f "$FAILED" ]; then
+          tail -c 300 "$FAILED" >&2
+        else
+          echo "context-saver: cannot start the setup in $DATA" >&2
+        fi
+        exit 1
+        ;;
+      *) echo "usage: $self ensure [--background]" >&2; exit 2 ;;
+    esac
+    ;;
+  *)
+    if ready; then
+      case $action in
+        mcp-proxy)
+          shift
+          for arg in "$@"; do
+            case $arg in --stdio) break ;; esac
+            case $arg in
+              --http|--http=*)
+                if ! mcp_ready; then
+                  start_setup --mcp || :
+                  echo "context-saver: mcp-proxy --http needs the MCP SDK (setting it up in the background; log: $LOG); or run: $self setup --mcp" >&2
+                  exit 3
+                fi
+                ;;
+            esac
+          done
+          exec "$PYTHON" "$ROOT/engine/mcp_proxy.py" "$@"
+          ;;
+        web-adapter) shift; exec "$PYTHON" "$ROOT/engine/web_adapter.py" "$@" ;;
+        session-start) touch_ready ;;
+      esac
+      exec "$PYTHON" "$ROOT/engine/hook.py" "$@"
+    fi
+    case $action in
+      ''|process|pre-tool|session-start)
+        # The tool call goes on unchanged while the venv is being built.
+        start_setup || :
+        exit 0
+        ;;
+      run)
+        prev=
+        found=
+        for arg in "$@"; do
+          case $prev in
+            --command) command=$arg; found=1 ;;
+          esac
+          case $arg in
+            --command=*) command=${arg#--command=}; found=1 ;;
+          esac
+          prev=$arg
+        done
+        if [ -n "$found" ]; then
+          start_setup || :
+          exec "${SHELL:-/bin/sh}" -c "$command"
+        fi
+        ;;
+      mcp-proxy)
+        shift
+        while [ $# -gt 0 ]; do
+          case $1 in
+            --stdio)
+              shift
+              if [ $# -gt 0 ]; then
+                # The wrapped server runs without compression for now.
+                start_setup || :
+                exec "$@"
+              fi
+              break
+              ;;
+            --http|--http=*)
+              start_setup --mcp || :
+              echo "context-saver: mcp-proxy --http needs the Python environment with the MCP SDK (setting it up in the background; log: $LOG); or run: $self setup --mcp" >&2
+              exit 3
+              ;;
+            --server) shift ;;
+          esac
+          [ $# -gt 0 ] && shift
+        done
+        ;;
+    esac
+    echo "context-saver: Python environment missing; run: $self setup" >&2
+    exit 3
     ;;
 esac

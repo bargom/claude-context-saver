@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 
+from common import USAGE_KEYS, private_dir, write_json
 from oversize import _integer, _source_lines, _unique_object
 
 PROVIDER = "claude_cli"
@@ -36,7 +37,10 @@ MAX_SUMMARY_WORDS = 350
 MAX_RESPONSE_CHARS = 16_000
 DEFAULT_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60
-USAGE_KEYS = ("input_tokens", "output_tokens", "thinking_tokens", "cache_read_tokens", "cache_write_tokens", "total_tokens")
+# After a failure that will repeat (no CLI, no login, no credit), no helper
+# starts for this long; every call would fail the same way.
+BACKOFF_SECONDS = 15 * 60
+BACKOFF_FILE = "helper-backoff.json"
 # Claude enforces the item-count limits at generation time.
 SCHEMA = {
     "type": "object",
@@ -155,11 +159,20 @@ def _usage(value: object) -> dict[str, int]:
 
 
 class ProviderFailure(Exception):
-    def __init__(self, code: str, usage: dict | None = None, usage_incomplete: bool = False):
+    def __init__(self, code: str, usage: dict | None = None, usage_incomplete: bool = False,
+                 backoff: str | None = None):
         super().__init__(code)
         self.code = code
         self.usage = _usage(usage)
         self.usage_incomplete = usage_incomplete
+        # A stable reason when the same failure would repeat on the next call.
+        self.backoff = backoff
+
+
+def _config_path() -> Path:
+    # The lookup of hook.CONFIG_PATH, done here so this module never imports hook.
+    return Path(os.environ.get("CONTEXT_SAVER_CONFIG") or
+                Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "context-saver/config.json")
 
 
 def _debug_enabled() -> bool:
@@ -168,10 +181,10 @@ def _debug_enabled() -> bool:
     if value is not None:
         return value == "1"
     try:
-        import hook
-        return hook.config()["debug_invalid_responses"] is True
-    except Exception:
+        stored = json.loads(_config_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return False
+    return isinstance(stored, dict) and stored.get("debug_invalid_responses") is True
 
 
 def _debug_response(state_dir: Path, response: str | None) -> str | None:
@@ -180,7 +193,7 @@ def _debug_response(state_dir: Path, response: str | None) -> str | None:
         return None
     try:
         directory = Path(state_dir) / "debug"
-        _private_dir(directory)
+        private_dir(directory)
         fd, name = tempfile.mkstemp(prefix="invalid-response-", suffix=".txt", dir=directory)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(response[:MAX_RESPONSE_CHARS])
@@ -201,6 +214,20 @@ def _failure_kind(output: str) -> str | None:
         return "provider_capacity"
     if re.search(r"\b(?:timeout|timed out|deadline.exceeded)\b", lowered):
         return "model_timeout"
+    return None
+
+
+_AUTH_FAILURE = re.compile(r"not logged in|login required|/login|unauthenticated|unauthorized|invalid api key|"
+                           r"authentication|oauth token|\b(?:401|403)\b", re.I)
+_CREDIT_FAILURE = re.compile(r"\bcredit", re.I)
+
+
+def _repeating_failure(output: str) -> str | None:
+    """Names a failure the next call would repeat: no login or no credit."""
+    if _CREDIT_FAILURE.search(output):
+        return "credit"
+    if _AUTH_FAILURE.search(output):
+        return "auth"
     return None
 
 
@@ -225,18 +252,16 @@ def _ttl() -> int:
         return DEFAULT_CACHE_TTL_SECONDS
 
 
-def _private_dir(path: Path) -> None:
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    metadata = path.lstat()
-    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
-        raise ValueError("unsafe_state_directory")
-    path.chmod(0o700)
-
-
 def _environment(*, thinking_off: bool = False) -> dict[str, str]:
-    # Native auth remains under the real HOME; exclude caller API keys,
-    # endpoint overrides, shell startup variables and cloud credentials.
-    allowed = ("HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "LANG", "LC_ALL", "TERM")
+    # Native auth remains under the real HOME (or CLAUDE_CONFIG_DIR); proxy and
+    # CA settings let the CLI reach the API from a corporate network. Caller API
+    # keys, endpoint overrides, shell startup variables and cloud credentials
+    # stay out.
+    allowed = ("HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "LANG", "LC_ALL", "TERM",
+               "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY",
+               "https_proxy", "http_proxy", "no_proxy", "all_proxy",
+               "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+               "CLAUDE_CONFIG_DIR")
     env = {key: os.environ[key] for key in allowed if key in os.environ}
     env["CONTEXT_SAVER_ACTIVE"] = "1"
     if thinking_off:
@@ -340,13 +365,15 @@ def _run_claude(captured: str, timeout_seconds: float, effort: str) -> tuple[dic
     # A subscription login defaults -p to 1-hour cache writes (2x input price);
     # every captured source is unique, so the write is never read back.
     # Measured 2026-09-28: 1h -> 5m cut a Sonnet 5.5 call from $0.043 to $0.030.
-    env["CLAUDE_CODE_PROMPT_CACHE_TTL"] = "5m"
+    # Measured 2026-10-17 (ledger, 5 Sonnet rows at 5m): cache_read 0/1027/0/0/0
+    # against cache writes of 8-26k each, so no cache write at all is cheaper.
+    env["DISABLE_PROMPT_CACHING"] = "1"
     token = _claude_token()
     if token:
         env["CLAUDE_CODE_OAUTH_TOKEN"] = token
     cli = shutil.which("claude", path=env.get("PATH")) or str(Path.home() / ".local/bin/claude")
     if not os.access(cli, os.X_OK):
-        raise ProviderFailure("claude_cli_missing")
+        raise ProviderFailure("claude_cli_missing", backoff="claude_cli_missing")
     with tempfile.TemporaryDirectory(prefix="claude-summary-") as workdir:
         argv = [cli, "-p", "--model", MODEL, *(["--effort", effort] if effort != "none" else []),
                 "--tools", "", "--strict-mcp-config", "--no-session-persistence",
@@ -365,14 +392,20 @@ def _run_claude(captured: str, timeout_seconds: float, effort: str) -> tuple[dic
     try:
         wrapper = json.loads(stdout)
     except ValueError:
-        raise ProviderFailure(_failure_kind(stderr) or "claude_cli_failed", usage_incomplete=True) from None
+        raise ProviderFailure(_failure_kind(stderr) or "claude_cli_failed", usage_incomplete=True,
+                              backoff=_repeating_failure(stderr)) from None
     if not isinstance(wrapper, dict):
         raise ProviderFailure("invalid_claude_json", usage_incomplete=True)
     usage, incomplete = _claude_usage(wrapper.get("usage"))
     if (process.returncode or wrapper.get("is_error") is not False or wrapper.get("type") != "result"
             or wrapper.get("subtype") != "success"):
         message = "\n".join((stderr, _failure_message(wrapper), str(wrapper.get("api_error_status") or "")))
-        raise ProviderFailure(_failure_kind(message) or "claude_cli_failed", usage, usage_incomplete=incomplete)
+        # Only CLI error text decides a backoff, never the text of a run that
+        # did not report an error (it may quote the captured source).
+        errors = message if wrapper.get("is_error") is True else "\n".join(
+            (stderr, str(wrapper.get("api_error_status") or "")))
+        raise ProviderFailure(_failure_kind(message) or "claude_cli_failed", usage, usage_incomplete=incomplete,
+                              backoff=_repeating_failure(errors))
     if wrapper.get("permission_denials"):
         raise ProviderFailure("unexpected_agent_activity", usage, usage_incomplete=incomplete)
     payload = wrapper.get("structured_output")
@@ -416,16 +449,47 @@ def _cache_write(path: Path, payload: dict, result: dict) -> None:
              "payload": payload, "usage": result["usage"],
              "usage_incomplete": bool(result.get("usage_incomplete", False)),
              **({"observed_model": result["observed_model"]} if "observed_model" in result else {})}
-    fd, temporary = tempfile.mkstemp(prefix=".pending-", dir=path.parent)
+    write_json(path, entry, indent=None)
+
+
+def _backoff_active(state_dir: Path) -> bool:
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(entry, handle, ensure_ascii=False)
-        os.replace(temporary, path)
-    finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
+        until = json.loads((state_dir / BACKOFF_FILE).read_text(encoding="utf-8"))["until"]
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+    now = time.time()
+    # A date beyond one backoff period (clock change, hand edit) is ignored.
+    return (isinstance(until, (int, float)) and not isinstance(until, bool)
+            and now < until <= now + BACKOFF_SECONDS)
+
+
+def _start_backoff(state_dir: Path, reason: str) -> None:
+    try:
+        write_json(state_dir / BACKOFF_FILE, {"until": time.time() + BACKOFF_SECONDS, "reason": reason})
+    except (OSError, ValueError):
+        pass
+
+
+def prune_cache(state_dir: Path, max_age_seconds: float) -> int:
+    """Deletes summary cache entries older than max_age_seconds and temporary
+    files of interrupted writes older than an hour; returns how many went."""
+    now = time.time()
+    removed = 0
+    state_dir = Path(state_dir)
+    for folder, pattern, max_age in ((state_dir / "cache", "*.json", max_age_seconds),
+                                     (state_dir / "cache", ".pending-*", 3600),
+                                     (state_dir, ".pending-*", 3600)):
+        if folder.is_symlink() or not folder.is_dir():
+            continue
+        for path in folder.glob(pattern):
+            try:
+                metadata = path.lstat()
+                if stat.S_ISREG(metadata.st_mode) and now - metadata.st_mtime > max_age:
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                continue
+    return removed
 
 
 def summarize(text: str, category: str, context: str, state_dir: Path,
@@ -456,14 +520,23 @@ def summarize(text: str, category: str, context: str, state_dir: Path,
         captured = json.dumps({"category": category, "context": context, "source": text}, ensure_ascii=False)
         key = hashlib.sha256(json.dumps([MODEL, effort, PROMPT_HASH, captured]).encode()).hexdigest()
         result["cache_key"] = key
-        cache_dir = Path(state_dir) / "cache"
-        _private_dir(Path(state_dir))
-        _private_dir(cache_dir)
+        state_dir = Path(state_dir)
+        cache_dir = state_dir / "cache"
+        try:
+            private_dir(state_dir)
+            private_dir(cache_dir)
+        except ValueError:
+            # A stable code: no path in the result.
+            raise ValueError("unsafe_state_directory") from None
         cache_path = cache_dir / f"{key}.json"
         ttl = _ttl()
         cached = _cache_read(cache_path, ttl, text)
         if cached:
             result.update(cached, status="cache_hit", cache_hit=True)
+            return result
+        # Cache hits still work during a backoff: they start no helper.
+        if _backoff_active(state_dir):
+            result.update(error="helper_backoff", usage_incomplete=False)
             return result
         try:
             payload, usage, incomplete, extra = _run_claude(captured, timeout_seconds, effort)
@@ -471,6 +544,8 @@ def summarize(text: str, category: str, context: str, state_dir: Path,
             result["usage"] = error.usage
             if error.usage_incomplete:
                 result["usage_incomplete"] = True
+            if error.backoff:
+                _start_backoff(state_dir, error.backoff)
             raise
         result["usage"] = usage
         if incomplete:
@@ -481,7 +556,7 @@ def summarize(text: str, category: str, context: str, state_dir: Path,
         if ttl:
             try:
                 _cache_write(cache_path, payload, result)
-            except OSError:
+            except (OSError, ValueError):
                 result["cache_write_error"] = True
     except TimeoutError:
         result["error"] = "model_timeout"

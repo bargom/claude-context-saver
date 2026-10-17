@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import hook
+from test_hook import isolated_env
 import web_adapter
 
 
@@ -86,9 +87,13 @@ class WebAdapterTests(unittest.TestCase):
                     {'search_query': [{'q': 'verbatim statement'}]},
                     {'search_query': [{'q': 'exact wording in docs'}]},
                     {'search_query': [{'q': 'context-saver:raw docs'}]},
-                    {'open': [{'ref_id': 'https://example.org'}], 'unknown': 1}]
+                    {'open': [{'ref_id': 'https://example.org'}], 'unknown': 1},
+                    {'search_query': [{'q': 'docs api_key="secret123456789"'}]}]
         for request in requests:
-            self.assertFalse(self.transform(self.event(request=request))['compressed'])
+            with self.subTest(request=request):
+                self.assertFalse(web_adapter.eligible(self.event(request=request)))
+                self.assertFalse(self.transform(self.event(request=request))['compressed'])
+        self.assertTrue(web_adapter.eligible(self.event()))
         self.assertFalse(self.transform({**self.event(), 'raw': True})['compressed'])
         with patch.dict(os.environ, {'CONTEXT_SAVER_RAW': '1'}):
             self.assertFalse(self.transform(self.event())['compressed'])
@@ -305,16 +310,18 @@ class WebAdapterTests(unittest.TestCase):
     def test_cli_payload_metacharacters_are_exact_data(self):
         payload = 'literal `touch /tmp/never-web-hook` $(printf nope) $HOME \\n\n"quote" λ'
         event = self.event(payload)
-        completed = subprocess.run([sys.executable, str(hook.ROOT / 'web_adapter.py')],
+        env = isolated_env(self.tmp.name)
+        completed = subprocess.run([sys.executable, str(hook.ROOT / 'web_adapter.py')], env=env,
                                    input=json.dumps(event), capture_output=True, text=True, check=True)
         self.assertEqual(json.loads(completed.stdout), {'compressed': False, 'result': payload})
-        completed = subprocess.run([sys.executable, str(hook.ROOT / 'web_adapter.py'), '--decision-only'],
+        completed = subprocess.run([sys.executable, str(hook.ROOT / 'web_adapter.py'), '--decision-only'], env=env,
                                    input=json.dumps(event), capture_output=True, text=True, check=True)
         self.assertEqual(json.loads(completed.stdout), {'compressed': False})
 
     def test_cli_invalid_transport_has_no_claim(self):
         completed = subprocess.run([sys.executable, str(hook.ROOT / 'web_adapter.py'), '--decision-only'],
-                                   input='{broken', capture_output=True, text=True, check=True)
+                                   env=isolated_env(self.tmp.name), input='{broken',
+                                   capture_output=True, text=True, check=True)
         self.assertEqual(json.loads(completed.stdout), {'compressed': False, 'error': 'invalid_envelope'})
 
 

@@ -26,7 +26,7 @@ test('engine commands go through the launcher', async () => {
   });
   assert.equal(await web({search_query: [{q: 'topic'}]}), 'summary');
   assert.match(commands[0], / \| '\/opt\/ccs\/bin\/context-saver' web-adapter --decision-only$/);
-  assert.match(commands[1], /^'\/opt\/ccs\/bin\/context-saver' web-delivered --delivery-token /);
+  assert.match(commands[1], /^'\/opt\/ccs\/bin\/context-saver' delivered --delivery-token /);
 });
 
 test('quoted shell payload preserves substitutions, apostrophes and newlines', async () => {
@@ -67,12 +67,24 @@ test('transport error, nonzero status and truncated JSON restore exact original'
 });
 
 test('polls yielded helper and joins output chunks', async () => {
+  const polls=[];
+  const chunks=['true,', '"result":"summary"}'];
   const web=make({
     web__run:async()=>'original',
-    exec_command:async()=>({output:'{"compressed":',session_id:42}),
-    write_stdin:async args=>{assert.equal(args.session_id,42);return {output:'true,"result":"summary"}',exit_code:0};},
+    exec_command:async({cmd})=>cmd.includes(' web-adapter ')
+      ? {output:'{"compressed":',session_id:42} : {output:'',exit_code:0},
+    write_stdin:async args=>{
+      polls.push(args);
+      const output=chunks.shift();
+      return chunks.length ? {output,session_id:42} : {output,exit_code:0};
+    },
   });
   assert.equal(await web({}), 'summary');
+  // The adapter poll keeps its own output budget and waits for the helper.
+  assert.deepEqual(polls, [
+    {session_id:42,chars:'',max_output_tokens:5000,yield_time_ms:10000},
+    {session_id:42,chars:'',max_output_tokens:5000,yield_time_ms:10000},
+  ]);
 });
 
 test('large web input uses bounded literal chunks and cleans its staging file', async () => {

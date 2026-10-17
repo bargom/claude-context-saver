@@ -71,7 +71,7 @@ class DeterministicTests(unittest.TestCase):
         source = json.dumps({'results': rows, 'total': 45, 'has_more': True})
         e = event(source, 'search_graph', offset=20, limit=12)
         output = hook.process(e, self.cfg, self.engine)['stopReason']
-        compact = output[output.index('COMPACT GRAPH INDEX'):output.index('\n\nOriginal output:')]
+        compact = output[output.index('COMPACT GRAPH INDEX'):output.index('\n\nThis is a navigation summary')]
         restored = read_index(compact)
         for before, after in zip(rows, restored):
             for key in ('name', 'label', 'qualified_name', 'file_path', 'signature'):

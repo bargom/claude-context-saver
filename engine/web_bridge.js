@@ -61,25 +61,15 @@ return async function summarizedWebRun(request, options = {}) {
       }
       command = adapter + ' < ' + quote(stagedPath);
     }
-    let response = await tools.exec_command({
-      cmd: command, max_output_tokens: 5000, yield_time_ms: 1000,
-    });
-    let output = response.output || '';
-    while (response.session_id !== undefined) {
-      response = await tools.write_stdin({
-        session_id: response.session_id, chars: '',
-        max_output_tokens: 5000, yield_time_ms: 10000,
-      });
-      output += response.output || '';
-    }
+    const response = await complete({cmd: command, max_output_tokens: 5000, yield_time_ms: 1000});
     if (response.exit_code !== 0) return original;
-    const decision = JSON.parse(output);
+    const decision = JSON.parse(response.output);
     if (decision.compressed === true && typeof decision.result === 'string' && decision.result.trim()) {
       // Count savings only after a complete adapter response reached this
       // bridge; a lost acknowledgment conservatively undercounts delivery.
       try {
         await complete({
-          cmd: quote(LAUNCHER) + ' web-delivered --delivery-token ' + quote(deliveryToken),
+          cmd: quote(LAUNCHER) + ' delivered --delivery-token ' + quote(deliveryToken),
           max_output_tokens: 100, yield_time_ms: 1000,
         });
       } catch (_) { /* Delivery still succeeds; its savings remain unconfirmed. */ }

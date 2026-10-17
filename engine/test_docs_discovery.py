@@ -6,7 +6,6 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-import deterministic
 import hook
 import mcp_proxy
 from test_mcp_proxy import request, response

@@ -11,9 +11,9 @@ import os
 import re
 import sys
 
+from common import WEB_TOOLS, text_blocks
 import hook
 
-OPERATIONS = frozenset({'search_query', 'open', 'find', 'click'})
 SOURCE_ID = re.compile(r'\bturn\d+[a-z]+\d+\b')
 URL = re.compile(r'https?://[^\s<>\[\]"\u3010\u3011]+')
 URL_TRAILING_PROSE = '.,;:'
@@ -40,13 +40,7 @@ def plain_text(response):
         return None
     if 'isError' in response and not isinstance(response['isError'], bool):
         return None
-    if not isinstance(response['content'], list) or not response['content']:
-        return None
-    if any(not isinstance(block, dict) or set(block) != {'type', 'text'} or
-           block['type'] != 'text' or not isinstance(block['text'], str)
-           for block in response['content']):
-        return None
-    return '\n'.join(block['text'] for block in response['content'])
+    return text_blocks(response['content'])
 
 
 def source_records(text):
@@ -101,15 +95,11 @@ def eligible(event):
         return False
     if os.environ.get('CONTEXT_SAVER_RAW') == '1':
         return False
-    if event.get('tool_name') not in {'web.run', 'web__run'}:
+    # The hook's own web rules: page-text operations only, no raw marker and
+    # no credential in the request.
+    if event.get('tool_name') not in WEB_TOOLS or hook.classify(event) is None:
         return False
-    request = event.get('tool_input')
-    if not isinstance(request, dict) or not set(request).issubset(OPERATIONS | {'response_length'}):
-        return False
-    if not any(request.get(operation) for operation in OPERATIONS):
-        return False
-    request_text = json.dumps(request, ensure_ascii=False)
-    return not (hook.RAW_MARKER.search(request_text) or EXACT_REQUEST.search(request_text))
+    return not EXACT_REQUEST.search(json.dumps(event['tool_input'], ensure_ascii=False))
 
 
 def source_urls(text):

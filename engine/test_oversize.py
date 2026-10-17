@@ -1,14 +1,23 @@
 import json
-import os
-from pathlib import Path
 import unittest
 
 import oversize
 
 
 EVENT = {'tool_name': 'mcp__codebase_memory_mcp__search_graph', 'tool_input': {}}
-# Optional real search_graph capture (kept private, never committed).
-SAMPLE = Path(os.environ.get('CONTEXT_SAVER_GRAPH_SAMPLE') or '/nonexistent/graph-sample.json.txt')
+
+
+def incident_rows(count=164):
+    """A redacted stand-in for the 164-match search_graph capture of the
+    incident: short docstrings, bulky metadata the index leaves out."""
+    return [{'name': f'match_{i}', 'label': ('Function', 'Method', 'Variable')[i % 3],
+             'file_path': f'src/lib/session/module_{i % 17}.js',
+             'qualified_name': f'project.src.lib.session.module_{i % 17}.match_{i}',
+             'signature': f'match_{i}(session, options = {{}})', 'lines': 20 + i,
+             'docstring': f'Redacted description of match {i}; keeps the session state for the call.',
+             'complexity': i % 9, 'properties': {'body_hash': f'{i:064x}', 'callers': [f'caller_{j}' for j in range(40)],
+                                                'source_excerpt': 'redacted source line\n' * 20}}
+            for i in range(count)]
 
 
 def graph_rows(count=164, docstring='Graph search documentation. ' * 70):
@@ -64,9 +73,8 @@ class OversizedResultsTests(unittest.TestCase):
         self.assertIn('extra_future_metadata', result['text'])
         self.assertNotIn('next_offset', result['coverage'])
 
-    @unittest.skipUnless(SAMPLE.exists(), 'retained real graph sample is not installed')
-    def test_retained_164_match_incident_preserves_all_docstrings(self):
-        raw = SAMPLE.read_text()
+    def test_164_match_incident_preserves_all_docstrings(self):
+        raw = source(incident_rows())
         expected = json.loads(raw)['results']
         result = oversize.prepare(raw, 'search', EVENT)
         self.assertGreater(len(raw), 180000)
@@ -116,6 +124,33 @@ class OversizedResultsTests(unittest.TestCase):
                     self.assertIsNone(oversize.prepare('\n' + scalar + '\n' + body, 'logs'))
         self.assertIsNone(oversize.prepare('null\n' * 15000, 'logs'))
         self.assertIsNone(oversize.prepare('null\n{"truncated":' + ' ' * 70000, 'logs'))
+
+    def test_bracketed_log_prefixes_are_prose_not_json(self):
+        for line in ('[INFO] worker finished a batch\n', '[2026-10-17 12:00:00] worker finished a batch\n',
+                     '{level=info} worker finished a batch\n', '[1] first step done\n'):
+            with self.subTest(line=line):
+                result = oversize.prepare(line * 4000, 'logs')
+                self.assertEqual(result['kind'], 'archive_preview')
+                self.assertIn(line.strip(), result['text'])
+
+    def test_cut_off_json_is_preserved(self):
+        rows = [{'id': i, 'name': f'row {i}', 'tags': ['a', 'b']} for i in range(3000)]
+        array, lines = json.dumps(rows), '\n'.join(json.dumps(row) for row in rows)
+        for text in (array[:-30], array[:int(len(array) * .95)], lines[:-10], json.dumps({'rows': rows})[:-1]):
+            with self.subTest(end=text[-20:]):
+                self.assertIsNone(oversize.prepare(text, 'logs'))
+        # Valid JSON documents and streams stay exact too.
+        for text in (array, lines, json.dumps({'rows': rows}, indent=2)):
+            self.assertIsNone(oversize.prepare(text, 'logs'))
+
+    def test_json_that_breaks_early_is_prose(self):
+        # Valid for a while, then not JSON at all well before the end.
+        text = '[1, 2, 3] ' + 'worker log line without structure\n' * 3000
+        self.assertEqual(oversize.prepare(text, 'logs')['kind'], 'archive_preview')
+        broken = '{"a": 1, oops ' + 'x' * 70000 + '}'
+        self.assertEqual(oversize.prepare(broken, 'logs')['kind'], 'archive_preview')
+        deep = '[' * 100000 + ']' * 100000
+        self.assertIsNone(oversize.prepare(deep, 'logs'))
 
     def test_numeric_log_line_followed_by_prose_still_gets_preview(self):
         raw = '42\n' + ('Build worker completed a batch.\n' * 3000)

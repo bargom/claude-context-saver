@@ -1,9 +1,12 @@
 """Protocol tests use a stub summarizer and never call a paid model."""
 import asyncio
+import contextlib
 import copy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
+import io
 import json
+import os
 from pathlib import Path
 import select
 import signal
@@ -15,10 +18,20 @@ import time
 import unittest
 from unittest.mock import patch
 
+import hook
 import mcp_proxy
 from test_hook import fake_claude, is_gone, wait_for_pid
 
 ROOT = Path(__file__).resolve().parent
+
+
+def private_env(folder, base=None):
+    """The environment of a proxy subprocess that never reads the developer's
+    own config.json, state or login files."""
+    folder = Path(folder)
+    return {**(base if base is not None else os.environ), 'HOME': str(folder),
+            'XDG_CONFIG_HOME': str(folder / '.config'), 'CONTEXT_SAVER_CONFIG': str(folder / 'config.json'),
+            'CONTEXT_SAVER_STATE': str(folder / 'state')}
 
 
 def request(identifier=1, name='search_graph', arguments=None):
@@ -34,6 +47,10 @@ def response(identifier=1, content=None, **extra):
 class CompressorTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.events = []
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        # Never read the developer's own config.json or write to the real state.
+        self.enterContext(patch.object(hook, 'CONFIG_PATH', folder / 'config.json'))
+        self.enterContext(patch.object(hook, 'STATE', folder / 'state'))
 
         def process(event):
             self.events.append(event)
@@ -158,6 +175,16 @@ class CompressorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(await self.proxy.transform(original), original)
         self.assertEqual(self.events, [])
 
+    async def test_text_is_taken_only_from_plain_text_blocks(self):
+        self.proxy.observe(request())
+        joined = await self.proxy.transform(response(content=[{'type': 'text', 'text': 'first ' * 20},
+                                                              {'type': 'text', 'text': 'second ' * 20}]))
+        self.assertEqual(joined['result']['content'], [{'type': 'text', 'text': 'Summary with exact path'}])
+        self.assertEqual(self.events[0]['tool_response']['content'][1]['text'], 'second ' * 20)
+        self.proxy.observe(request())
+        mixed = response(content=[{'type': 'text', 'text': 'large ' * 100}, {'type': 'text', 'text': None}])
+        self.assertIs(await self.proxy.transform(mixed), mixed)
+
     async def test_pending_is_bounded_and_reused_ids_clear(self):
         for index in range(mcp_proxy.MAX_PENDING + 10):
             self.proxy.observe(request(index))
@@ -167,8 +194,9 @@ class CompressorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(await self.proxy.transform(original), original)
 
 
-BOOTSTRAP = '''import asyncio, sys, time
+BOOTSTRAP = '''import asyncio, os, sys, time
 import mcp_proxy
+mcp_proxy.MAX_LINE_BYTES = int(os.environ.get('TEST_MAX_LINE_BYTES') or mcp_proxy.MAX_LINE_BYTES)
 def stub(event):
     text = event['tool_response']['content'][0]['text']
     if text.startswith('slow'):
@@ -187,15 +215,18 @@ try:
 except asyncio.CancelledError:
     pass
 '''
-CHILD = '''import json, sys
+CHILD = '''import json, os, sys
 print('child diagnostic', file=sys.stderr)
 for line in sys.stdin:
     message = json.loads(line)
+    if os.environ.get('CHILD_LOG_IDS'):
+        print('received', message.get('id'), file=sys.stderr, flush=True)
     if 'id' not in message:
         print(line, end='', flush=True)
         continue
     if message.get('method') == 'tools/call':
-        text = message['params']['arguments'].get('text', 'raw')
+        arguments = message['params']['arguments']
+        text = arguments.get('text', 'raw') * arguments.get('repeat', 1)
         result = {'content': [{'type': 'text', 'text': text}], 'isError': False}
     else:
         result = {'capabilities': {'tools': {'listChanged': True}}, 'opaque': None}
@@ -215,6 +246,8 @@ def read_message(process, timeout=10):
 
 class StdioTests(unittest.TestCase):
     def start(self, *args, bootstrap=BOOTSTRAP, env=None):
+        folder = self.enterContext(tempfile.TemporaryDirectory())
+        env = private_env(folder, env)
         process = subprocess.Popen([sys.executable, '-u', '-c', bootstrap, *args], cwd=ROOT, env=env,
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
         self.addCleanup(self.stop, process)
@@ -253,6 +286,42 @@ class StdioTests(unittest.TestCase):
         self.assertEqual(process.stderr.read(), b'child diagnostic\n')
 
 
+    def test_lines_over_the_limit_are_dropped_and_the_bridge_keeps_running(self):
+        env = {**os.environ, 'TEST_MAX_LINE_BYTES': '1024', 'CHILD_LOG_IDS': '1'}
+        process = self.start('stdio', sys.executable, '-u', '-c', CHILD, env=env)
+        self.send(process, request('oversized', arguments={'text': 'y' * 3000}))
+        self.send(process, request('after', arguments={'text': 'raw exact'}))
+        self.assertEqual(read_message(process)['id'], 'after')
+        self.send(process, request('big', arguments={'text': 'x', 'repeat': 3000}))
+        self.send(process, request('after2', arguments={'text': 'raw exact'}))
+        answered = read_message(process)
+        self.assertEqual((answered['id'], answered['result']['content'][0]['text']), ('after2', 'raw exact'))
+        process.stdin.close()
+        self.assertEqual(process.wait(timeout=8), 0)
+        stderr = process.stderr.read().decode()
+        self.assertIn('dropped a client line over 1024 bytes', stderr)
+        self.assertIn('dropped a server line over 1024 bytes', stderr)
+        self.assertNotIn('yyyy', stderr)
+        self.assertNotIn('xxxx', stderr)
+        # The oversized request never reached the server.
+        self.assertEqual([line.split()[1] for line in stderr.splitlines() if line.startswith('received')],
+                         ['after', 'big', 'after2'])
+
+    def test_http_mode_without_the_sdk_names_the_setup_command(self):
+        probe = ("import sys\n"
+                 "sys.modules['mcp'] = None\n"
+                 "sys.modules['mcp_types'] = None\n"
+                 "import mcp_proxy\n"
+                 "sys.argv = ['mcp_proxy', '--server', 'docs', '--http', 'http://127.0.0.1:9/mcp']\n"
+                 "sys.exit(mcp_proxy.main())\n")
+        folder = self.enterContext(tempfile.TemporaryDirectory())
+        result = subprocess.run([sys.executable, '-c', probe], cwd=ROOT, env=private_env(folder),
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 3)
+        launcher = ROOT.parent / 'bin' / 'context-saver'
+        self.assertIn(f'--http needs the MCP SDK; run: {launcher} setup --mcp', result.stderr)
+        self.assertEqual(result.stdout, '')
+
     def test_stopping_the_proxy_ends_a_running_summary_helper(self):
         folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
         env, pid_file = fake_claude(folder)
@@ -262,6 +331,36 @@ class StdioTests(unittest.TestCase):
         process.send_signal(signal.SIGTERM)
         self.assertEqual(process.wait(timeout=8), 0)
         self.assertTrue(is_gone(helper))
+
+
+class LineReaderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_an_oversized_line_is_dropped_whole(self):
+        for chunks in ([b'{"a":1}\n' + b'x' * 100 + b'\n{"b":2}\n{"c":3}'],
+                       # The long line arrives in pieces, past the buffer limit.
+                       [b'{"a":1}\n', b'x' * 40, b'x' * 40, b'x' * 40 + b'\n{"b":2}\n', b'{"c":3}']):
+            reader = asyncio.StreamReader(limit=16)
+            stderr = io.StringIO()
+            with self.subTest(chunks=len(chunks)), contextlib.redirect_stderr(stderr):
+                async def feed():
+                    for chunk in chunks:
+                        reader.feed_data(chunk)
+                        await asyncio.sleep(0)
+                    reader.feed_eof()
+                feeder = asyncio.create_task(feed())
+                lines = []
+                while line := await mcp_proxy.read_line(reader, 'server'):
+                    lines.append(line)
+                await feeder
+                self.assertEqual(lines, [b'{"a":1}\n', b'{"b":2}\n', b'{"c":3}'])
+                self.assertIn('dropped a server line over', stderr.getvalue())
+                self.assertNotIn('xxx', stderr.getvalue())
+
+    def test_protocol_version_needs_a_result_object(self):
+        self.assertEqual(mcp_proxy.protocol_version_of({'id': 1, 'result': {'protocolVersion': '2025-03-26'}}),
+                         '2025-03-26')
+        for message in ({'id': 1, 'result': ['protocolVersion']}, {'id': 1, 'result': 'text'},
+                        {'id': 1, 'result': None}, {'id': 1}, {'id': 1, 'result': {'protocolVersion': 7}}):
+            self.assertIsNone(mcp_proxy.protocol_version_of(message))
 
 
 @unittest.skipUnless(importlib.util.find_spec('mcp'), 'official MCP SDK not installed')

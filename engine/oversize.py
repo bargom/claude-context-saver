@@ -6,10 +6,15 @@ or explicitly become partial archive previews; unknown JSON contracts stay intac
 import json
 import os.path
 
+from common import CATEGORIES
+
 
 _IDENTITY = ('name', 'label', 'file_path', 'qualified_name')
 _RETAINED = frozenset((*_IDENTITY, 'signature', 'lines', 'docstring'))
-_CATEGORIES = frozenset(('search', 'logs', 'git', 'documentation'))
+_CATEGORIES = frozenset(CATEGORIES)
+# A failed decode this close to the end is a cut-off JSON value, not prose.
+_TRUNCATED_TAIL_CHARS = 512
+_TRUNCATED_FRACTION = .9
 
 
 def _json(value):
@@ -72,6 +77,16 @@ def _graph(text, category, context):
         if any(k in row and not isinstance(row[k], str) for k in ('signature', 'docstring')):
             return None
     return source, offset
+
+
+def _prefixes(rows):
+    """Common file_path/qualified_name prefixes of 8+ characters, printed once."""
+    prefixes = {}
+    for field in ('file_path', 'qualified_name'):
+        prefix = os.path.commonprefix([row[field] for row in rows])
+        if len(prefix) >= 8:
+            prefixes[field] = prefix
+    return prefixes
 
 
 def _coverage(source, offset, shown, docs):
@@ -161,7 +176,12 @@ def _text_preview(text, budget):
 
 
 def _json_contract(text):
-    """Recognize a JSON value or whitespace-separated JSON stream, including scalars."""
+    """Recognize a JSON value or whitespace-separated JSON stream, including scalars.
+
+    An object or array that fails to decode still counts when the failure is
+    near the end (a cut-off value); one that fails near its start, such as an
+    `[INFO]` or `[2026-10-17 12:00:00]` log prefix, is prose.
+    """
     decoder = json.JSONDecoder()
     index = 0
     parsed = False
@@ -171,15 +191,16 @@ def _json_contract(text):
             index += 1
         if index == len(text):
             return parsed
-        # Preserve truncated objects/arrays too, including after a scalar row.
-        if text[index] in '{[':
-            return True
         if parsed and index == start:
             return False
         try:
             _, index = decoder.raw_decode(text, index)
-        except (ValueError, RecursionError):
-            return False
+        except json.JSONDecodeError as error:
+            return text[index] in '{[' and (error.pos >= len(text) - _TRUNCATED_TAIL_CHARS or
+                                             error.pos >= _TRUNCATED_FRACTION * len(text))
+        except RecursionError:
+            # Nesting too deep to decode here is still structured data.
+            return text[index] in '{['
         parsed = True
 
 
@@ -203,11 +224,7 @@ def prepare(text, category, context=None, max_chars=60000):
             # Pathological pagination counters can themselves exceed the budget;
             # preserving the original is safer than clipping their exact values.
             return None
-        prefixes = {}
-        for field in ('file_path', 'qualified_name'):
-            prefix = os.path.commonprefix([r[field] for r in source['results']])
-            if len(prefix) >= 8:
-                prefixes[field] = prefix
+        prefixes = _prefixes(source['results'])
         for docs in (True, False):
             compact, coverage = _render_graph(source, offset, len(source['results']), docs, prefixes)
             if len(compact) <= max_chars:

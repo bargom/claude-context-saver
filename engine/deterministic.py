@@ -5,17 +5,16 @@ replacement token budget. Graph/code candidates retain every match; docs search
 can explicitly become a partial archive index when all identities cannot fit.
 """
 import json
-import os.path
 import re
 
-from oversize import _graph, _integer, _json, _render_graph, _source_lines, _unique_object
+from common import ANSI
+from oversize import _graph, _integer, _json, _prefixes, _render_graph, _source_lines, _unique_object
 
 
 _SEARCH_KEYS = frozenset(('results', 'raw_matches', 'directories', 'total_grep_matches',
                           'total_results', 'raw_match_count', 'elapsed_ms', 'dedup_ratio'))
 _ROW_KEYS = frozenset(('node', 'qualified_name', 'label', 'file', 'start_line', 'end_line',
                        'in_degree', 'out_degree', 'match_lines', 'context', 'context_start'))
-_ANSI = re.compile(r'\x1b\[[0-9;]*m')
 _JEST_SUMMARY = re.compile(r'^(Test Suites|Tests|Snapshots):\s+(?:\d+ (?:failed|passed|skipped|pending|todo|obsolete|written),?\s*)*\d+ total\s*$')
 _PASS_SUITE = re.compile(r'^ ?PASS\s+\S+\.(?:[cm]?[jt]sx?)(?:\s+\([\d.]+\s*s\))?\s*$')
 _PASS_TEST = re.compile(r'^\s+[✓✔]\s+.+\(\d+(?:\.\d+)?\s*(?:m?s)\)\s*$')
@@ -159,7 +158,7 @@ def _jest(text, category):
     if category != 'logs':
         return None
     lines = _source_lines(text, keepends=True)
-    plain = [_ANSI.sub('', line).rstrip('\r\n') for line in lines]
+    plain = [ANSI.sub('', line).rstrip('\r\n') for line in lines]
     # Require Jest's complete count footer, not a lone PASS-looking application log.
     footers = {match.group(1) for line in plain if (match := _JEST_SUMMARY.fullmatch(line))}
     if not {'Test Suites', 'Tests', 'Snapshots'} <= footers:
@@ -196,11 +195,7 @@ def candidates(text, category, event, cfg=None):
     graph = _graph(text, category, event)
     if graph is not None:
         source, offset = graph
-        prefixes = {}
-        for field in ('file_path', 'qualified_name'):
-            prefix = os.path.commonprefix([row[field] for row in source['results']])
-            if len(prefix) >= 8:
-                prefixes[field] = prefix
+        prefixes = _prefixes(source['results'])
         for docs in (True, False):
             body, coverage = _render_graph(source, offset, len(source['results']), docs, prefixes)
             yield {'text': body, 'kind': 'graph_index', 'coverage': coverage}

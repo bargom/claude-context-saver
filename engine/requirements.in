@@ -1,4 +1,5 @@
-# Direct dependencies; requirements.txt is generated from this file with:
+# Direct dependencies of the engine; requirements.txt is generated from this file with:
 #   uv pip compile requirements.in --universal --python-version 3.10 --generate-hashes -o requirements.txt
+# The MCP SDK (only `context-saver mcp-proxy --http` needs it) is the optional
+# extra in requirements-mcp.in, installed by `context-saver setup --mcp`.
 tiktoken==0.12.0
-mcp==2.2.0

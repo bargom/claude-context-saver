@@ -1,0 +1,5 @@
+# Optional extra for `context-saver mcp-proxy --http` (the Codex HTTP MCP bridge),
+# installed by `context-saver setup --mcp` into the engine venv. requirements-mcp.txt
+# is generated from this file, with the engine pins as constraints, with:
+#   uv pip compile requirements-mcp.in -c requirements.txt --universal --python-version 3.10 --generate-hashes -o requirements-mcp.txt
+mcp==2.2.0

@@ -3,7 +3,6 @@ import os
 import re
 from pathlib import Path
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
@@ -11,7 +10,22 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+import common
 import hook
+import summary_engine
+
+
+def isolated_env(folder, **extra):
+    """The environment of a subprocess test: its own HOME, state, config and
+    data folders, so it never reads the developer's config.json or token file."""
+    folder = Path(folder)
+    env = {**os.environ, 'HOME': str(folder / 'home'), 'XDG_CONFIG_HOME': str(folder / 'home' / '.config'),
+           'CONTEXT_SAVER_STATE': str(folder / 'state'), 'CONTEXT_SAVER_CONFIG': str(folder / 'config.json'),
+           'CONTEXT_SAVER_DATA': str(folder / 'data')}
+    for name in ('CONTEXT_SAVER_EFFORT', 'CONTEXT_SAVER_SUMMARIZE_SHELL', 'CONTEXT_SAVER_ACTIVE', 'CONTEXT_SAVER_RAW'):
+        env.pop(name, None)
+    env.update(extra)
+    return env
 
 
 def fake_claude(folder):
@@ -22,7 +36,12 @@ def fake_claude(folder):
     fake.parent.mkdir()
     fake.write_text(f'#!/bin/sh\necho $$ > {shlex.quote(str(pid_file))}\nexec sleep 60\n')
     fake.chmod(0o755)
-    return {**os.environ, 'PATH': f'{fake.parent}{os.pathsep}{os.environ["PATH"]}'}, pid_file
+    return isolated_env(folder, PATH=f'{fake.parent}{os.pathsep}{os.environ["PATH"]}'), pid_file
+
+
+def ledger(state):
+    path = Path(state) / 'events.jsonl'
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
 
 def wait_for_pid(pid_file, timeout=10):
@@ -52,12 +71,20 @@ class HookTests(unittest.TestCase):
         # Never read the developer's own config.json.
         self.config_patch = patch.object(hook, 'CONFIG_PATH', self.state / 'config.json')
         self.config_patch.start()
+        if not hasattr(summary_engine, 'prune_cache'):
+            # Stream C adds it; until then session_start needs a stand-in.
+            prune = patch.object(summary_engine, 'prune_cache', lambda *args: 0, create=True)
+            prune.start()
+            self.addCleanup(prune.stop)
         self.cfg = dict(hook.DEFAULTS, minimum_tokens=1000)
 
     def tearDown(self):
         self.config_patch.stop()
         self.state_patch.stop()
         self.tmp.cleanup()
+
+    def env(self, **extra):
+        return isolated_env(self.state, **extra)
 
     def event(self, command='rg -n handler src', text=None):
         return {'hook_event_name': 'PostToolUse', 'tool_name': 'Bash', 'session_id': 'test',
@@ -101,10 +128,11 @@ class HookTests(unittest.TestCase):
         self.assertEqual(report['helper_usage']['total_tokens'], 2100)
 
     def test_provider_and_cache_labels_match_complete_payload_ledger(self):
+        # Claude is the only summary helper, whatever provider name a result carries.
         cases = [('claude_cli', 'sonnet', False, 'Claude (sonnet)'),
                  ('claude_cli', 'sonnet', True, 'Claude (sonnet)'),
-                 ('other', 'custom-model', False, 'custom-model'),
-                 ('other', None, False, 'other')]
+                 ('other', 'custom-model', False, 'Claude (custom-model)'),
+                 ('other', None, False, 'Claude')]
         for provider, model, cached, producer in cases:
             with self.subTest(provider=provider, cached=cached, model=model):
                 result = dict(self.engine(), provider=provider, model=model, cache_hit=cached,
@@ -284,6 +312,175 @@ class HookTests(unittest.TestCase):
         self.assertIn('exit_code=1', out['stopReason'])
         self.assertIn('ERROR exact failure marker 123', out['stopReason'])
 
+    def claude_bash(self, command='npm test', output=None, stderr='', **extra):
+        """A Claude Code Bash event: no exit_code, stderr given apart (C1)."""
+        output = output or ('src/a.js:12: function handler() { return 1; }\n' * 300)
+        return {'hook_event_name': 'PostToolUse', 'tool_name': 'Bash', 'session_id': 'cc', 'tool_use_id': 'toolu_1',
+                'tool_input': {'command': command},
+                'tool_response': {'output': output + ('\n' + stderr if stderr else ''), 'stderr': stderr, **extra}}
+
+    def test_unknown_exit_code_is_not_reported_as_zero(self):
+        out = hook.process(self.claude_bash('rg -n handler src'), self.cfg, self.engine)['stopReason'].splitlines()
+        self.assertTrue(out[1].startswith('[Context summary via helper: search; isError=False; estimated original tokens='))
+        self.assertNotIn('exit_code', out[1])
+        event = self.claude_bash('rg -n handler src')
+        event['tool_response']['exit_code'] = 0
+        self.assertIn('; exit_code=0; ', hook.process(event, self.cfg, self.engine)['stopReason'].splitlines()[1])
+
+    def test_original_output_is_line_three(self):
+        engine = lambda **kw: dict(self.engine(), summary='Original output: /not/the/archive\n- handler at src/a.js:12')
+        out = hook.process(self.event(), self.cfg, engine)['stopReason']
+        lines = out.splitlines()
+        row = ledger(self.state)[-1]
+        self.assertEqual(lines[2], f"Original output: {row['raw_file']}")
+        self.assertEqual(re.search(r'Original output: (\S+)', out)[1], row['raw_file'])
+        self.assertEqual(lines[3], 'Original output: /not/the/archive')
+
+    def test_error_lines_in_a_log_get_excerpts_without_an_exit_code(self):
+        log = ('PASS src/ok.test.js\n' * 400) + 'Error: exact database failure 42\n    at db.js:9\n' + ('done\n' * 5)
+        out = hook.process(self.claude_bash('pytest -q', log), self.cfg, self.engine)['stopReason']
+        self.assertIn('Exact failure excerpts (original):', out)
+        self.assertIn('Error: exact database failure 42\n    at db.js:9', out)
+        # A search result is not a log: no excerpts without a known failure.
+        text = 'src/error_handler.js:3: function onError() {}\n' * 300
+        out = hook.process(self.claude_bash('rg -n onError src', text), self.cfg, self.engine)['stopReason']
+        self.assertNotIn('Exact failure excerpts', out)
+
+    def test_stderr_tail_is_kept_exactly_and_bounded(self):
+        stderr = 'x' * 1000 + '\n' + ''.join(f'warning {i}: deprecated option\n' for i in range(20))
+        out = hook.process(self.claude_bash('rg -n handler src', stderr=stderr), self.cfg, self.engine)['stopReason']
+        tail = out.split('Exact stderr tail (original):\n', 1)[1]
+        self.assertEqual(tail, '\n'.join(f'warning {i}: deprecated option' for i in range(12, 20)))
+        out = hook.process(self.claude_bash('rg -n handler src', stderr='y' * 1000), self.cfg, self.engine)['stopReason']
+        self.assertEqual(out.split('Exact stderr tail (original):\n', 1)[1], 'y' * 800)
+        # Not repeated when the failure excerpts already hold it.
+        short = 'fatal: exact stderr line'
+        event = self.claude_bash('rg -n handler src', stderr=short)
+        event['tool_response']['exit_code'] = 2
+        out = hook.process(event, self.cfg, self.engine)['stopReason']
+        self.assertIn('Exact failure excerpts (original):', out)
+        self.assertEqual(out.count(short), 1)
+        self.assertNotIn('Exact stderr tail', out)
+
+    def test_extract_keeps_only_reported_metadata(self):
+        text, metadata = hook.extract({'output': 'x', 'stderr': '', 'return_code_interpretation': 'No matches found'})
+        self.assertEqual((text, metadata), ('x', {'return_code_interpretation': 'No matches found'}))
+        _, metadata = hook.extract({'output': 'x', 'stderr': 'e', 'exit_code': 1, 'wall_time_seconds': 2.5,
+                                    'return_code_interpretation': None})
+        self.assertEqual(metadata, {'stderr': 'e', 'exit_code': 1})
+        _, metadata = hook.extract({'output': 'x', 'isError': True})
+        self.assertEqual(metadata, {'isError': True})
+        self.assertEqual(hook.extract({'output': 'x', 'isError': 'yes'})[1], {})
+        for content in ([{'type': 'text', 'text': 'a'}, 42], [], [{'type': 'text', 'text': 'a', '_meta': {}}]):
+            self.assertEqual(hook.extract({'content': content}), ('', {'unsupported_content': True}))
+        self.assertEqual(hook.extract({'content': [{'type': 'text', 'text': 'a'}, {'type': 'text', 'text': 'b'}],
+                                       'isError': True}), ('a\nb', {'isError': True}))
+
+    def test_shell_summary_context_is_the_command_only(self):
+        contexts = []
+        engine = lambda **kw: contexts.append(kw['context']) or self.engine()
+        for extra in ({}, {'description': 'Find handlers', 'timeout': 60000}):
+            event = self.event()
+            event['tool_input'].update(extra)
+            hook.process(event, self.cfg, engine)
+        codex = dict(self.event(), tool_name='exec_command', tool_input={'cmd': 'rg -n handler src', 'yield_time_ms': 1000})
+        hook.process(codex, self.cfg, engine)
+        self.assertEqual(contexts[:2], ['Tool: Bash; command: rg -n handler src'] * 2)
+        self.assertEqual(contexts[2], 'Tool: exec_command; command: rg -n handler src')
+        mcp = dict(self.event(), tool_name='mcp__codebase_memory_mcp__search_code', tool_input={'pattern': 'handler', 'limit': 5},
+                   tool_response={'content': [{'type': 'text', 'text': self.event()['tool_response']['output']}]})
+        hook.process(mcp, dict(self.cfg, deterministic_first=False), engine)
+        self.assertEqual(contexts[3], 'Tool: mcp__codebase_memory_mcp__search_code; request: {"pattern": "handler", "limit": 5}')
+
+    def test_small_output_returns_before_the_credential_scan(self):
+        for text in ('api_key="secret123456789"\n', 'x' * 999):
+            self.assertIsNone(hook.process(self.event(text=text), self.cfg, self.engine))
+        self.assertEqual(ledger(self.state), [])
+        # The byte length decides: 1000 bytes of emoji are far fewer characters.
+        self.assertIsNone(hook.process(self.event(text='api_key="secret123456789" ' + '\U0001f9ec' * 250), self.cfg, self.engine))
+        self.assertEqual(ledger(self.state)[-1]['status'], 'skipped_sensitive')
+
+    def test_persisted_output_rows_and_stats(self):
+        event = dict(self.event(), persisted_output=True)
+        hook.process(event, self.cfg, self.engine)
+        hook.process(dict(event, tool_use_id='call2'), self.cfg, lambda **kw: {'status': 'error', 'error': 'model_timeout'})
+        hook.process(self.event('rg -n other src'), self.cfg, self.engine)
+        rows = ledger(self.state)
+        self.assertEqual([row.get('persisted') for row in rows], [True, True, None])
+        report = hook.stats()
+        compressed = [row for row in rows if row['status'] == 'compressed']
+        self.assertEqual(report['compressed_outputs'], 2)
+        self.assertEqual(report['persisted_outputs'], 1)
+        self.assertEqual(report['persisted_tokens_saved'], compressed[0]['before_tokens'] - compressed[0]['after_tokens'])
+        self.assertIn('persisted_tokens_saved', report['limits'])
+        self.assertIn('full output', report['limits'])
+
+    def test_archive_is_written_only_for_an_accepted_replacement(self):
+        raw = self.state / 'raw'
+        self.assertIsNone(hook.process(self.event(), dict(self.cfg, maximum_replacement_tokens=200),
+                                       lambda **kw: dict(self.engine(), summary='long summary ' * 400)))
+        self.assertEqual(ledger(self.state)[-1]['status'], 'insufficient_saving')
+        self.assertEqual(list(raw.glob('*')) if raw.exists() else [], [])
+        self.assertIsNone(hook.process(self.event(), self.cfg, lambda **kw: {'status': 'error', 'error': 'model_timeout'}))
+        self.assertEqual(list(raw.glob('*')) if raw.exists() else [], [])
+        out = hook.process(self.event(), self.cfg, self.engine)['stopReason']
+        path = Path(ledger(self.state)[-1]['raw_file'])
+        self.assertEqual(list(raw.iterdir()), [path])
+        self.assertEqual(path.read_text(), self.event()['tool_response']['output'])
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertIn(str(path), out)
+        # The same text again (another writer, or an earlier call) is success, unchanged.
+        stamp = time.time() - 3 * 86400
+        os.utime(path, (stamp, stamp))
+        self.assertIsNotNone(hook.process(self.event(), self.cfg, self.engine))
+        self.assertEqual(list(raw.iterdir()), [path])
+        self.assertGreater(path.stat().st_mtime, stamp + 86400)
+        # A concurrent writer linked the file first: FileExistsError is success.
+        with patch.object(hook.Path, 'exists', return_value=False):
+            self.assertEqual(hook.archive(self.event()['tool_response']['output']), path)
+        self.assertEqual(list(raw.iterdir()), [path])
+
+    def test_bracketed_logs_over_the_size_limit_get_a_preview(self):
+        never = lambda **kw: self.fail('a preview needs no helper')
+        for line in ('[INFO] worker finished a batch\n', '[2026-10-17 12:00:00] worker finished a batch\n'):
+            with self.subTest(line=line):
+                out = hook.process(self.event('tail -n 5000 app.log', line * 3000), self.cfg, never)
+                self.assertIsNotNone(out)
+                self.assertIn('ARCHIVE PREVIEW', out['stopReason'])
+        cut_off = json.dumps([{'id': i, 'name': f'row {i}'} for i in range(5000)])[:-40]
+        self.assertIsNone(hook.process(self.event('tail -n 5000 app.log', cut_off), self.cfg, never))
+        self.assertEqual(ledger(self.state)[-1]['status'], 'skipped_oversize')
+
+    def test_secret_patterns_and_references(self):
+        # Built from pieces, so no complete token-shaped literal sits in this file.
+        fake = 'Fake0' * 8
+        secrets = ['glpat' + '-' + fake[:20], 'xox' + 'b-1234567890-' + fake[:12], 'xox' + 'p-1234567890-' + fake[:12],
+                   'eyJ' + fake[:20] + '.eyJ' + fake[:20] + '.' + fake[:24],
+                   'mongodb+srv://admin:' + fake[:10] + '@cluster0.example.net/db', 'postgres://app:' + fake[:6] + '@db:5432/app',
+                   'aws_secret_access_key = ' + fake, 'AWS_SECRET_ACCESS_KEY=' + fake,
+                   'sk' + '_live_' + fake[:24], 'rk' + '_test_' + fake[:24],
+                   'npm' + '_' + fake[:36], '-----BEGIN PGP PRIVATE KEY BLOCK-----',
+                   'GITHUB_TOKEN=abcdef123456', 'API_SECRET: "s3cr3t-value-x"', 'TOKEN = abcdefgh12345',
+                   'export SLACK_BOT_TOKEN="xyz12345abc"']
+        references = ['GITHUB_TOKEN=$GITHUB_TOKEN', 'GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN }}"',
+                      'API_TOKEN = process.env.API_TOKEN', 'SECRET=os.environ["SECRET"]', "TOKEN: ENV['TOKEN']",
+                      'TOKEN: {{ .Values.token }}', 'aws_secret_access_key = ${AWS_SECRET_ACCESS_KEY}',
+                      'postgres://app:$DB_PASSWORD@db:5432/app', 'MAX_TOKEN = 128000', 'TOKEN_SLICE_CHARS = 2048',
+                      'https://example.com:8080/path@v2', 'git@github.com:org/repo.git', 'ssh://git@github.com/org/repo']
+        for value in secrets:
+            with self.subTest(secret=value):
+                self.assertTrue(hook.sensitive(value))
+                self.assertTrue(hook.sensitive(json.dumps({'text': value})))
+        for value in references:
+            with self.subTest(reference=value):
+                self.assertFalse(hook.sensitive(value))
+
+    def test_secret_scan_stays_linear_on_long_runs(self):
+        for text in ('A' * 300_000, 'a.' * 150_000, 'a1+' * 100_000):
+            started = time.monotonic()
+            self.assertFalse(hook.sensitive(text))
+            self.assertLess(time.monotonic() - started, 5, text[:10])
+
     def test_classifies_tool_categories(self):
         for cmd, category in [('git diff --stat', 'git'), ('pytest -q', 'logs'), ('kubectl logs pod', 'logs'), ('rg -n needle src', 'search')]:
             self.assertEqual(hook.classify(self.event(cmd)), category)
@@ -454,10 +651,62 @@ class HookTests(unittest.TestCase):
         self.assertIsNotNone(hook.process(event, self.cfg, self.engine))
         self.assertEqual(hook.stats()['compressed_outputs'], 0)
         self.assertEqual(hook.stats()['helper_usage']['total_tokens'], 2100)
+        # Ledgers written before 0.3.0 hold web_delivered rows.
         for _ in range(2):
             hook.append_event({'status': 'web_delivered', 'delivery_token': 'web_test_1', 'saved_tokens': 0})
         self.assertEqual(hook.stats()['compressed_outputs'], 1)
         self.assertEqual(hook.stats()['helper_usage']['total_tokens'], 2100)
+
+    def test_any_event_with_a_delivery_token_counts_only_once_delivered(self):
+        event = dict(self.event(), delivery_token='cs-toolu_01')
+        replacement = hook.process(event, self.cfg, self.engine)['stopReason']
+        row = ledger(self.state)[-1]
+        self.assertEqual((row['status'], row['delivery_token'], row['tool']), ('compression_candidate', 'cs-toolu_01', 'Bash'))
+        self.assertEqual(hook.stats()['compressed_outputs'], 0)
+        result = subprocess.run([sys.executable, str(hook.ROOT / 'hook.py'), 'delivered', '--delivery-token', 'cs-toolu_01'],
+                                capture_output=True, text=True, env=self.env(CONTEXT_SAVER_STATE=str(self.state)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {'delivered': True})
+        self.assertEqual({k: ledger(self.state)[-1][k] for k in ('status', 'delivery_token', 'saved_tokens')},
+                         {'status': 'delivered', 'delivery_token': 'cs-toolu_01', 'saved_tokens': 0})
+        report = hook.stats()
+        self.assertEqual(report['compressed_outputs'], 1)
+        self.assertEqual(report['estimated_after_tokens'], hook.tokens(replacement))
+        self.assertEqual(report['statuses']['delivered'], 1)
+        # No token (Codex run path, MCP proxy): counted at once.
+        hook.process(self.event('rg -n other src'), self.cfg, self.engine)
+        self.assertEqual(ledger(self.state)[-1]['status'], 'compressed')
+        self.assertEqual(hook.stats()['compressed_outputs'], 2)
+
+    def test_web_delivered_alias_writes_the_delivered_row_and_bad_tokens_fail(self):
+        for action in ('web-delivered', 'delivered'):
+            for token in ('', 'bad token', 'x' * 101):
+                with self.subTest(action=action, token=token):
+                    result = subprocess.run([sys.executable, str(hook.ROOT / 'hook.py'), action, '--delivery-token', token],
+                                            capture_output=True, text=True, env=self.env(CONTEXT_SAVER_STATE=str(self.state)))
+                    self.assertEqual(result.returncode, 2)
+        result = subprocess.run([sys.executable, str(hook.ROOT / 'hook.py'), 'web-delivered', '--delivery-token', 'web_1'],
+                                capture_output=True, text=True, env=self.env(CONTEXT_SAVER_STATE=str(self.state)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = ledger(self.state)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual({k: v for k, v in rows[0].items() if k != 'time'},
+                         {'status': 'delivered', 'delivery_token': 'web_1', 'saved_tokens': 0})
+
+    def test_pre_tool_rewrite_is_a_plain_launcher_command(self):
+        e = self.event("rg -n 'a b' src");e['hook_event_name'] = 'PreToolUse'
+        e.update(session_id='s 1', tool_use_id="call'1")
+        out = hook.pre_tool(e)['hookSpecificOutput']
+        self.assertEqual(out['permissionDecision'], 'allow')
+        launcher = str(hook.ROOT.parent / 'bin' / 'context-saver')
+        wrapped = out['updatedInput']['command']
+        # Exactly the launcher and quoted words: no VAR= prefix, $ expansion or substitution.
+        self.assertEqual(wrapped, ' '.join(shlex.quote(word) for word in
+                                           [launcher, 'run', '--command', "rg -n 'a b' src",
+                                            '--session-id', 's 1', '--tool-use-id', "call'1"]))
+        self.assertEqual(shlex.split(wrapped), [launcher, 'run', '--command', "rg -n 'a b' src",
+                                                '--session-id', 's 1', '--tool-use-id', "call'1"])
+        self.assertTrue(wrapped.startswith(shlex.quote(launcher) + ' run '))
 
     def test_pre_tool_preserves_original_command_and_skips_compounds(self):
         e = self.event("rg -n 'a b' src");e['hook_event_name'] = 'PreToolUse'
@@ -507,25 +756,29 @@ class HookTests(unittest.TestCase):
 
     def test_run_preserves_small_output_and_failure(self):
         r = subprocess.run([sys.executable, str(hook.ROOT / 'hook.py'), 'run', '--command', 'printf exact-output; exit 7'],
-                           capture_output=True, text=True, cwd=self.state)
+                           capture_output=True, text=True, cwd=self.state, env=self.env())
         self.assertEqual(r.returncode, 7)
         self.assertEqual(r.stdout, 'exact-output')
 
-    @unittest.skipUnless(shutil.which('bash') and Path('/bin/zsh').is_file(), 'bash and /bin/zsh are required')
-    def test_run_resolves_the_callers_shell_on_path(self):
-        r = subprocess.run([sys.executable, str(hook.ROOT / 'hook.py'), 'run', '--command',
-                            'printf %s "${BASH_VERSION:+bash}"'],
-                           capture_output=True, text=True, cwd=self.state, timeout=30,
-                           env={**os.environ, 'CONTEXT_SAVER_SHELL': 'bash', 'SHELL': '/bin/zsh'})
-        self.assertEqual(r.returncode, 0)
-        self.assertEqual(r.stdout, 'bash')
+    def test_run_uses_the_users_shell_else_bin_sh(self):
+        shells = [(shell, shell) for shell in ('/bin/zsh', '/bin/bash') if Path(shell).is_file()]
+        shells += [('/nonexistent/shell', '/bin/sh'), (None, '/bin/sh')]
+        for shell, expected in shells:
+            with self.subTest(shell=shell):
+                env = self.env(**({'SHELL': shell} if shell else {}))
+                if shell is None:
+                    env.pop('SHELL', None)
+                r = subprocess.run([sys.executable, str(hook.ROOT / 'hook.py'), 'run', '--command', 'printf %s "$0"'],
+                                   capture_output=True, text=True, cwd=self.state, timeout=30, env=env)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(r.stdout, expected)
 
     def test_run_replays_output_when_the_wrapper_is_stopped(self):
         # The command stops its own wrapper ($PPID), as a tool timeout does.
         r = subprocess.run([sys.executable, str(hook.ROOT / 'hook.py'), 'run', '--command',
                             'printf partial-output; kill -TERM $PPID; sleep 5'],
                            capture_output=True, text=True, cwd=self.state, timeout=30,
-                           env={**os.environ, 'CONTEXT_SAVER_SHELL': '/bin/sh'})
+                           env=self.env(SHELL='/bin/sh'))
         self.assertEqual(r.returncode, 143)
         self.assertEqual(r.stdout, 'partial-output')
 
@@ -572,7 +825,7 @@ class HookTests(unittest.TestCase):
         try:
             result = subprocess.run([*argv, 'run', '--command', command],
                                     capture_output=True, text=True, cwd=hook.ROOT, timeout=10,
-                                    env={**os.environ, 'CONTEXT_SAVER_SHELL': '/bin/sh'})
+                                    env=self.env(SHELL='/bin/sh'))
             self.assertEqual(result.returncode, 128 + signum, result.stderr)
             self.assertEqual(result.stdout, 'partial-output')
             self.assertTrue(is_gone(wait_for_pid(pid_file)), 'The background sleep survived cancellation')
@@ -583,19 +836,20 @@ class HookTests(unittest.TestCase):
                 except ProcessLookupError:
                     pass
 
-    def test_wrapped_pipeline_keeps_the_callers_pipefail(self):
+    def test_wrapped_command_runs_the_original_and_keeps_its_status(self):
         e = self.event('grep -n handler missing.txt | cat');e['hook_event_name'] = 'PreToolUse'
         wrapped = hook.pre_tool(e)['hookSpecificOutput']['updatedInput']['command']
-        env = {**os.environ, 'CONTEXT_SAVER_STATE': str(self.state), 'CONTEXT_SAVER_CONFIG': str(self.state / 'config.json')}
-        for options, status in [('', 0), ('set -o pipefail; ', 2)]:
-            r = subprocess.run(['bash', '-c', options + wrapped], cwd=self.state, env=env,
-                               capture_output=True, text=True, timeout=60)
-            self.assertEqual(r.returncode, status, options)
+        argv = shlex.split(wrapped)
+        self.assertEqual(argv[:3], [str(hook.ROOT.parent / 'bin' / 'context-saver'), 'run', '--command'])
+        # The engine behind the launcher, with the same arguments.
+        r = subprocess.run([sys.executable, str(hook.ROOT / 'hook.py'), *argv[1:]], cwd=self.state,
+                           env=self.env(SHELL='/bin/sh'), capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('missing.txt', r.stdout)
 
     def test_stopping_process_ends_the_running_summary_helper(self):
         env, pid_file = fake_claude(self.state)
         (self.state / 'config.json').write_text(json.dumps({'minimum_tokens': 1000, 'deterministic_first': False}))
-        env.update(CONTEXT_SAVER_STATE=str(self.state / 'state'), CONTEXT_SAVER_CONFIG=str(self.state / 'config.json'))
         with subprocess.Popen([sys.executable, str(hook.ROOT / 'hook.py'), 'process'], env=env, cwd=self.state,
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
             process.stdin.write(json.dumps(self.event()).encode())
@@ -609,7 +863,8 @@ class HookTests(unittest.TestCase):
         code = "import hook; from unittest.mock import patch; " + \
                "p=patch.object(hook.tempfile, 'TemporaryFile', side_effect=OSError('read-only')); p.start(); " + \
                "raise SystemExit(hook.run_command('printf direct-output; exit 3'))"
-        result = subprocess.run([sys.executable, '-c', code], cwd=hook.ROOT, capture_output=True, text=True, timeout=30)
+        result = subprocess.run([sys.executable, '-c', code], cwd=hook.ROOT, capture_output=True, text=True, timeout=30,
+                                env=self.env())
         self.assertEqual(result.returncode, 3)
         self.assertEqual(result.stdout, 'direct-output')
 
@@ -617,56 +872,184 @@ class HookTests(unittest.TestCase):
         code = "import hook, os, signal; from unittest.mock import patch; " + \
                "p=patch.object(hook, 'process', side_effect=lambda *a, **k: os.kill(os.getpid(), signal.SIGTERM)); p.start(); " + \
                "raise SystemExit(hook.run_command('printf finished-output'))"
-        result = subprocess.run([sys.executable, '-c', code], cwd=hook.ROOT, capture_output=True, text=True, timeout=30)
+        result = subprocess.run([sys.executable, '-c', code], cwd=hook.ROOT, capture_output=True, text=True, timeout=30,
+                                env=self.env())
         self.assertEqual(result.returncode, 143)
         self.assertEqual(result.stdout, 'finished-output')
 
     def test_weekly_reminder_is_throttled(self):
         first = hook.session_start()
-        self.assertIn('weekly check due', first['hookSpecificOutput']['additionalContext'])
+        context = first['hookSpecificOutput']['additionalContext']
+        self.assertIn('weekly check due', context)
+        # Codex has no /context-saver command: the CLI form is given for both hosts.
+        self.assertIn('`context-saver stats --days 7`', context)
+        self.assertIn('`context-saver review --note=<finding>`', context)
+        self.assertIn('Claude Code: /context-saver stats 7', context)
+        self.assertIn('Claude Code: /context-saver review <finding>', context)
         self.assertIsNone(hook.session_start())
+
+    def aged(self, path, days, text='content'):
+        common.private_dir(path.parent)
+        path.write_text(text)
+        stamp = time.time() - days * 86400
+        os.utime(path, (stamp, stamp))
+        return path
 
     def test_weekly_check_prunes_old_debug_responses_with_raw_archive(self):
         debug = self.state / 'engine' / 'debug'
-        hook.secure_dir(debug)
-        old, recent = debug / 'invalid-response-old.txt', debug / 'invalid-response-new.txt'
-        for path in (old, recent):
-            path.write_text('rejected helper output')
-        stale = time.time() - 8 * 86400
-        os.utime(old, (stale, stale))
+        old = self.aged(debug / 'invalid-response-old.txt', 8)
+        recent = self.aged(debug / 'invalid-response-new.txt', 0)
         hook.session_start()
         self.assertFalse(old.exists())
         self.assertTrue(recent.exists())
 
     def test_retention_runs_when_the_reminder_is_not_due(self):
-        hook.save_json(self.state / 'review.json', {'last_reminder_at': time.time()})
-        raw = self.state / 'raw'
-        hook.secure_dir(raw)
-        old = raw / 'old.txt'
-        old.write_text('original')
-        stale = time.time() - 8 * 86400
-        os.utime(old, (stale, stale))
+        common.write_json(self.state / 'review.json', {'last_reminder_at': time.time()})
+        old = self.aged(self.state / 'raw' / 'old.txt', 8)
         self.assertIsNone(hook.session_start())
         self.assertFalse(old.exists())
+
+    def test_session_start_sweeps_web_inputs_and_summary_cache(self):
+        old_input, new_input = self.aged(self.state / 'web-input.AbC123', 2), self.aged(self.state / 'web-input.XyZ789', 0)
+        kept = self.aged(self.state / 'raw' / 'recent.txt', 6)
+        self.assertIsNotNone(hook.session_start(dict(hook.DEFAULTS)))
+        self.assertFalse(old_input.exists())
+        self.assertTrue(new_input.exists())
+        self.assertTrue(kept.exists())
+
+    @unittest.skipUnless(hasattr(summary_engine, 'prune_cache'), 'summary_engine.prune_cache (stream C) is required')
+    def test_session_start_prunes_the_summary_cache_with_the_retention_days(self):
+        cache = self.state / 'engine' / 'cache'
+        old, recent = self.aged(cache / ('a' * 64 + '.json'), 3), self.aged(cache / ('b' * 64 + '.json'), 1)
+        hook.session_start(dict(hook.DEFAULTS, retention_days=2))
+        self.assertFalse(old.exists())
+        self.assertTrue(recent.exists())
+
+    def test_corrupt_review_file_does_not_stop_cleanup_or_the_reminder(self):
+        for content in ('{broken', '[]', '{"last_reminder_at": "yesterday"}'):
+            with self.subTest(content=content):
+                (self.state / 'review.json').write_text(content)
+                old = self.aged(self.state / 'raw' / 'old.txt', 8)
+                output = hook.session_start()
+                self.assertFalse(old.exists())
+                self.assertIn('weekly check due', output['hookSpecificOutput']['additionalContext'])
+                self.assertIsInstance(json.loads((self.state / 'review.json').read_text())['last_reminder_at'], float)
+
+    def test_session_start_rewrites_a_large_ledger_without_year_old_rows(self):
+        path = self.state / 'events.jsonl'
+        now = time.time()
+        old = json.dumps({'time': now - 400 * 86400, 'status': 'compressed', 'pad': 'x' * 2000}) + '\n'
+        recent = json.dumps({'time': now - 10 * 86400, 'status': 'skipped_busy'}) + '\n'
+        common.private_dir(self.state)
+        with path.open('w') as handle:
+            handle.write(old * 2700 + 'not json\n' + recent)
+        path.chmod(0o600)
+        self.assertGreater(path.stat().st_size, hook.LEDGER_LIMIT_BYTES)
+        hook.session_start()
+        self.assertEqual(path.read_text(), recent)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        # A ledger under the limit is left alone, old rows and all.
+        with path.open('a') as handle:
+            handle.write(old)
+        before = path.read_text()
+        common.write_json(self.state / 'review.json', {'last_reminder_at': time.time()})
+        hook.session_start()
+        self.assertEqual(path.read_text(), before)
+
+    def test_ledger_rewrite_waits_for_appends_under_the_shared_lock(self):
+        hook.append_event({'status': 'first'})
+        with hook.ledger_lock(hook.fcntl.LOCK_SH):
+            # An exclusive lock cannot be taken while an append holds the shared one.
+            fd = os.open(self.state / 'events.lock', os.O_RDWR)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    hook.fcntl.flock(fd, hook.fcntl.LOCK_EX | hook.fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+        self.assertEqual([row['status'] for row in ledger(self.state)], ['first'])
 
     def test_invalid_config_values_are_rejected_by_name(self):
         path = self.state / 'config.json'
         self.assertIs(hook.config()['debug_invalid_responses'], False)
         for key, value in [('debug_invalid_responses', 'yes'), ('enabled', 1), ('minimum_tokens', 999),
                            ('minimum_tokens', 'many'), ('minimum_saving_fraction', 1), ('timeout_seconds', None),
-                           ('effort', 'turbo'), ('effort', None)]:
+                           ('effort', 'turbo'), ('effort', None), ('minimum_tokens', True), ('minimum_tokens', 5000.5),
+                           ('timeout_seconds', 'NaN'), ('minimum_saving_fraction', True),
+                           ('minimum_saving_fraction', '0.05'), ('retention_days', 0), ('retention_days', '7 days'),
+                           ('retention_days', 366), ('review_every_days', 0), ('review_every_days', False),
+                           ('categories', 'search'), ('categories', ['search', 'source_code']), ('categories', [1]),
+                           ('rtk_binary', None), ('rtk_binary', 7)]:
             with self.subTest(key=key, value=value):
                 path.write_text(json.dumps({key: value}))
                 with self.assertRaisesRegex(ValueError, f'invalid {key}'):
                     hook.config()
 
-    def test_config_checks_still_run_under_python_optimize(self):
+    def test_every_default_is_validated(self):
+        self.assertLessEqual(set(hook.DEFAULTS), set(hook.VALID))
+        with patch.dict(os.environ):
+            for name in (hook.EFFORT_ENV, hook.SHELL_ENV):
+                os.environ.pop(name, None)
+            self.assertEqual(hook.config(), hook.DEFAULTS)
+
+    def test_config_stores_converted_numbers(self):
+        path = self.state / 'config.json'
+        path.write_text(json.dumps({'minimum_tokens': '3500', 'maximum_source_chars': 60000.0,
+                                    'timeout_seconds': ' 60 ', 'minimum_saving_fraction': '0.3',
+                                    'maximum_replacement_tokens': 1500, 'retention_days': '14',
+                                    'review_every_days': 30.0, 'categories': [], 'rtk_binary': '/opt/rtk'}))
+        cfg = hook.config()
+        expected = {'minimum_tokens': 3500, 'maximum_source_chars': 60000, 'timeout_seconds': 60,
+                    'minimum_saving_fraction': 0.3, 'maximum_replacement_tokens': 1500, 'retention_days': 14,
+                    'review_every_days': 30, 'categories': [], 'rtk_binary': '/opt/rtk'}
+        for key, value in expected.items():
+            with self.subTest(key=key):
+                self.assertEqual(cfg[key], value)
+                self.assertIs(type(cfg[key]), type(value))
+        # Converted values work where the raw strings failed (timeout reaches the engine as an int).
+        seen = {}
+        hook.process(self.event(), dict(cfg, minimum_tokens=1000, categories=list(common.CATEGORIES)),
+                     lambda **kw: seen.update(kw) or self.engine())
+        self.assertEqual(seen['timeout_seconds'], 60)
+        # With no category enabled nothing is compressed.
+        self.assertIsNone(hook.process(self.event(), dict(cfg, minimum_tokens=1000), self.engine))
+
+    def test_unreadable_config_files_are_named_errors(self):
+        path = self.state / 'config.json'
+        for content, message in (('{broken', 'not valid JSON'), ('[1, 2]', 'must hold a JSON object')):
+            with self.subTest(content=content):
+                path.write_text(content)
+                with self.assertRaisesRegex(ValueError, message):
+                    hook.config()
+
+    def test_config_errors_reach_the_host_from_limits_and_session_start(self):
         path = self.state / 'config.json'
         path.write_text(json.dumps({'timeout_seconds': 5000}))
-        result = subprocess.run([sys.executable, '-O', str(hook.ROOT / 'hook.py'), 'limits'], capture_output=True,
-                                text=True, env={**os.environ, 'CONTEXT_SAVER_CONFIG': str(path)})
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('invalid timeout_seconds', result.stderr)
+        # -O: the checks are not asserts, so they still run under optimization.
+        for action, extra in (('limits', {'minimum_tokens': None}), ('session-start', {})):
+            with self.subTest(action=action):
+                result = subprocess.run([sys.executable, '-O', str(hook.ROOT / 'hook.py'), action], capture_output=True,
+                                        text=True, env=self.env())
+                self.assertEqual(result.returncode, 0, result.stderr)
+                output = json.loads(result.stdout)
+                self.assertIn('invalid timeout_seconds', output.pop('configError'))
+                self.assertEqual(output, extra)
+
+    def test_stats_days_must_be_positive_and_all_time_is_null(self):
+        hook.append_event({'status': 'compressed', 'before_tokens': 10, 'after_tokens': 4, 'saved_tokens': 6})
+        for days in ('0', '-3', 'week'):
+            with self.subTest(days=days):
+                result = subprocess.run([sys.executable, str(hook.ROOT / 'hook.py'), 'stats', '--days', days],
+                                        capture_output=True, text=True, env=self.env(CONTEXT_SAVER_STATE=str(self.state)))
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, '')
+        for argv, period in ((['stats'], None), (['stats', '--days', '1'], 1)):
+            result = subprocess.run([sys.executable, str(hook.ROOT / 'hook.py'), *argv],
+                                    capture_output=True, text=True, env=self.env(CONTEXT_SAVER_STATE=str(self.state)))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertIs(report['period_days'], period)
+            self.assertEqual(report['estimated_context_tokens_saved'], 6)
+            self.assertNotIn('helper_tokens', report['rtk'])
 
     def test_configured_effort_reaches_engine_and_claude_cost_is_reported(self):
         seen = {}
@@ -697,7 +1080,8 @@ class HookTests(unittest.TestCase):
         code = "import hook; from unittest.mock import patch; " + \
                "p=patch.object(hook, 'config', side_effect=ValueError('bad config')); p.start(); " + \
                "raise SystemExit(hook.run_command('printf still-exact; exit 7'))"
-        result = subprocess.run([sys.executable, '-c', code], cwd=hook.ROOT, capture_output=True, text=True)
+        result = subprocess.run([sys.executable, '-c', code], cwd=hook.ROOT, capture_output=True, text=True,
+                                env=self.env())
         self.assertEqual(result.returncode, 7)
         self.assertEqual(result.stdout, 'still-exact')
 
@@ -749,7 +1133,7 @@ class PluginConfigTests(unittest.TestCase):
     def test_web_bridge_prints_this_machines_paths(self):
         state = Path(self.tmp.name) / 'state'
         result = subprocess.run([sys.executable, str(hook.ROOT / 'hook.py'), 'web-bridge'], capture_output=True, text=True,
-                                env={**os.environ, 'CONTEXT_SAVER_STATE': str(state)})
+                                env=isolated_env(self.tmp.name, CONTEXT_SAVER_STATE=str(state)))
         self.assertEqual(result.returncode, 0)
         self.assertNotIn('__CONTEXT_SAVER_', result.stdout)
         self.assertIn(json.dumps(str(hook.ROOT.parent / 'bin' / 'context-saver')), result.stdout)
@@ -760,15 +1144,15 @@ class PluginConfigTests(unittest.TestCase):
         stored = {'effort': 'low', 'shell_helpers_enabled': False}
         self.config_path.write_text(json.dumps(stored))
         result = subprocess.run([sys.executable, str(hook.ROOT / 'hook.py'), 'disable'], capture_output=True, text=True,
-                                env={**os.environ, 'CONTEXT_SAVER_CONFIG': str(self.config_path),
-                                     'CONTEXT_SAVER_EFFORT': 'high', 'CONTEXT_SAVER_SUMMARIZE_SHELL': '1'})
+                                env=isolated_env(self.tmp.name, CONTEXT_SAVER_CONFIG=str(self.config_path),
+                                                 CONTEXT_SAVER_EFFORT='high', CONTEXT_SAVER_SUMMARIZE_SHELL='1'))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(self.config_path.read_text()), {**stored, 'enabled': False})
 
     def test_limits_report_the_configured_minimum(self):
         self.config_path.write_text(json.dumps({'minimum_tokens': 2000}))
         result = subprocess.run([sys.executable, str(hook.ROOT / 'hook.py'), 'limits'], capture_output=True, text=True,
-                                env={**os.environ, 'CONTEXT_SAVER_CONFIG': str(self.config_path)})
+                                env=isolated_env(self.tmp.name, CONTEXT_SAVER_CONFIG=str(self.config_path)))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), {'minimum_tokens': 2000})
 
@@ -776,8 +1160,8 @@ class PluginConfigTests(unittest.TestCase):
         envelope = {'tool_name': 'web.run', 'tool_input': {'search_query': [{'q': 'topic'}]}, 'tool_response': 'short'}
         result = subprocess.run(['sh', str(hook.ROOT.parent / 'bin' / 'context-saver'), 'web-adapter', '--decision-only'],
                                 input=json.dumps(envelope), capture_output=True, text=True,
-                                env={**os.environ, 'CONTEXT_SAVER_PYTHON': sys.executable,
-                                     'CONTEXT_SAVER_DATA': self.tmp.name, 'CONTEXT_SAVER_STATE': self.tmp.name})
+                                env=isolated_env(self.tmp.name, CONTEXT_SAVER_PYTHON=sys.executable,
+                                                 CONTEXT_SAVER_DATA=self.tmp.name, CONTEXT_SAVER_STATE=self.tmp.name))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), {'compressed': False})
 

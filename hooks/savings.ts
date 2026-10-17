@@ -44,9 +44,11 @@ export function savingLine(saving: Saving, sessionTokens: number, isVsFullOutput
 /** `/context-saver <args>` to the engine CLI's argv; undefined for unknown input. */
 export function commandArgv(args: string): string[] | undefined {
   const [action = 'stats', ...rest] = args.trim().split(/\s+/).filter(Boolean)
-  if (action === 'stats') return /^\d{1,4}$/.test(rest[0] ?? '7') ? ['stats', '--days', rest[0] ?? '7'] : undefined
+  // At least one day: the engine reads an omitted --days as all time.
+  if (action === 'stats') return /^[1-9]\d{0,3}$/.test(rest[0] ?? '7') ? ['stats', '--days', rest[0] ?? '7'] : undefined
   if (['status', 'setup', 'enable', 'disable'].includes(action) && rest.length === 0) return [action]
-  if (action === 'review' && rest.length > 0) return ['review', '--note', rest.join(' ')]
+  // One argument, so a note that starts with "-" is not read as an option.
+  if (action === 'review' && rest.length > 0) return ['review', `--note=${rest.join(' ')}`]
   return undefined
 }
 

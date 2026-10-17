@@ -6,15 +6,18 @@ import shlex
 import shutil
 import subprocess
 
-_ANSI = re.compile(r'\x1b\[[0-9;]*m')
+from common import ANSI, ENV_ASSIGNMENT, GIT_VALUE_OPTIONS, SHELL_TOOLS, failed, first_operand
+
 _DIAGNOSTIC = re.compile(r'\b(?:error|failed|failure|exception|traceback|panic|fatal|warning|warn)\b', re.I)
 
 
 def select_filter(text, category, event):
-    if category not in ('git', 'logs') or event.get('tool_name') not in ('Bash', 'exec_command', 'shell', 'shell_command'):
+    if category not in ('git', 'logs') or event.get('tool_name') not in SHELL_TOOLS:
         return None
     response = event.get('tool_response')
-    if not isinstance(response, dict) or response.get('exit_code') != 0 or response.get('isError'):
+    # An unknown exit code (Claude Code Bash) passes; the success patterns
+    # below and the diagnostic check still decide.
+    if not isinstance(response, dict) or failed(response):
         return None
     arguments = event.get('tool_input') or {}
     command = arguments.get('command', arguments.get('cmd', ''))
@@ -25,12 +28,12 @@ def select_filter(text, category, event):
         args = shlex.split(command)
     except ValueError:
         return None
-    while args and re.fullmatch(r'[A-Za-z_]\w*=.*', args[0]):
+    while args and ENV_ASSIGNMENT.fullmatch(args[0]):
         args.pop(0)
     if not args or '\x00' in text:
         return None
     head = Path(args.pop(0)).name
-    clean = _ANSI.sub('', text)
+    clean = ANSI.sub('', text)
     diagnostic_text = re.sub(r'^test result: ok\. \d+ passed; 0 failed; \d+ ignored; \d+ measured; \d+ filtered out; finished in [\d.]+s\s*$', '', clean, flags=re.M) if head == 'cargo' else clean
     if clean.lstrip().startswith(('{', '[')) or (category == 'logs' and _DIAGNOSTIC.search(diagnostic_text)):
         return None
@@ -38,13 +41,16 @@ def select_filter(text, category, event):
     if any(re.match(r'(?:--(?:json|porcelain|format|pretty|reporter|output|junitxml|xml)|-z)(?:=|$)', a) for a in args):
         return None
     if head == 'git':
-        while len(args) >= 2 and args[0] == '-C':
-            args = args[2:]
-        if args == ['status'] and clean.startswith(('On branch ', 'HEAD detached ')):
+        # Global options as hook.classify reads them; -c may set a pager or alias.
+        index, verb = first_operand(args, GIT_VALUE_OPTIONS)
+        rest = args[index + 1:]
+        if '-c' in args[:index]:
+            return None
+        if verb == 'status' and not rest and clean.startswith(('On branch ', 'HEAD detached ')):
             return 'git-status'
-        if args and args[0] == 'log' and re.match(r'^commit [0-9a-f]{40,64}\n', clean):
+        if verb == 'log' and re.match(r'^commit [0-9a-f]{40,64}\n', clean):
             # Default log format only; patch/stat/name output is exact evidence.
-            if all(a.isdigit() or re.fullmatch(r'-\d+|--max-count=\d+', a) or a in ('-n', '--max-count') for a in args[1:]):
+            if all(a.isdigit() or re.fullmatch(r'-\d+|--max-count=\d+', a) or a in ('-n', '--max-count') for a in rest):
                 return 'git-log'
         return None
     if head in ('vitest', 'npm', 'pnpm', 'yarn', 'bun', 'make') and re.search(r'^\s*Test Files\s+\d+ passed', clean, re.M):
@@ -67,7 +73,7 @@ def retained_lines(text, selected):
     if pattern is None:
         return ''
     return '\n'.join(line for line in text.splitlines()
-                     if line.strip() and not re.fullmatch(pattern, _ANSI.sub('', line)))
+                     if line.strip() and not re.fullmatch(pattern, ANSI.sub('', line)))
 
 
 def candidate(text, category, event, cfg):

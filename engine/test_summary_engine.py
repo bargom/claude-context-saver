@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -37,7 +38,12 @@ class EngineTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.state = Path(self.temporary.name) / "state"
         self.source = "src/app.py:12: ValueError: missing name\n"
-        self.env = patch.dict(os.environ, {"CONTEXT_SAVER_CACHE_TTL_SECONDS": "604800"})
+        # Never read the developer's own config.json or home folder.
+        self.config = Path(self.temporary.name) / "config.json"
+        self.env = patch.dict(os.environ, {"CONTEXT_SAVER_CACHE_TTL_SECONDS": "604800",
+                                           "CONTEXT_SAVER_CONFIG": str(self.config),
+                                           "HOME": self.temporary.name,
+                                           "XDG_CONFIG_HOME": str(Path(self.temporary.name) / ".config")})
         self.env.start()
         # Never read the real login file or start the real CLI in tests.
         self.token_file = Path(self.temporary.name) / "claude-token.txt"
@@ -290,6 +296,7 @@ class EngineTests(unittest.TestCase):
                 patch.object(engine.subprocess, "Popen") as popen:
             self.assertEqual(self.summarize()["error"], "claude_cli_missing")
         popen.assert_not_called()
+        (self.state / engine.BACKOFF_FILE).unlink()
         with patch.object(engine.subprocess, "Popen", side_effect=FileNotFoundError()):
             self.assertEqual(self.summarize()["error"], "cli_or_state_missing")
         result = self.summarize_answer(claude_output(PAYLOAD, usage={
@@ -308,7 +315,8 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(result["usage"]["total_tokens"], 932)
 
     def test_invalid_response_diagnostics_are_opt_in_private_and_bounded(self):
-        with patch.dict(os.environ), patch("hook.config", return_value={"debug_invalid_responses": False}):
+        self.config.write_text(json.dumps({"debug_invalid_responses": False}))
+        with patch.dict(os.environ):
             os.environ.pop("CONTEXT_SAVER_DEBUG_INVALID_RESPONSE", None)
             self.assertIsNone(engine._debug_response(self.state, "private text"))
         with patch.dict(os.environ, {"CONTEXT_SAVER_DEBUG_INVALID_RESPONSE": "1"}):
@@ -320,14 +328,32 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(bounded.read_text()), engine.MAX_RESPONSE_CHARS)
 
     def test_config_flag_enables_diagnostics_and_environment_overrides_it(self):
-        with patch.dict(os.environ), patch("hook.config", return_value={"debug_invalid_responses": True}):
+        self.config.write_text(json.dumps({"debug_invalid_responses": True}))
+        with patch.dict(os.environ):
             os.environ.pop("CONTEXT_SAVER_DEBUG_INVALID_RESPONSE", None)
             self.assertEqual(Path(engine._debug_response(self.state, "kept")).read_text(), "kept")
             os.environ["CONTEXT_SAVER_DEBUG_INVALID_RESPONSE"] = "0"
             self.assertIsNone(engine._debug_response(self.state, "dropped"))
-        with patch.dict(os.environ), patch("hook.config", side_effect=ValueError("invalid configuration")):
+        for broken in ("not json", json.dumps(["debug_invalid_responses"]),
+                       json.dumps({"debug_invalid_responses": "yes"})):
+            self.config.write_text(broken)
+            with self.subTest(config=broken), patch.dict(os.environ):
+                os.environ.pop("CONTEXT_SAVER_DEBUG_INVALID_RESPONSE", None)
+                self.assertIsNone(engine._debug_response(self.state, "dropped"))
+        self.config.unlink()
+        with patch.dict(os.environ):
             os.environ.pop("CONTEXT_SAVER_DEBUG_INVALID_RESPONSE", None)
             self.assertIsNone(engine._debug_response(self.state, "dropped"))
+
+    def test_debug_flag_is_read_without_importing_hook(self):
+        self.config.write_text(json.dumps({"debug_invalid_responses": True}))
+        env = {key: value for key, value in os.environ.items() if key != "CONTEXT_SAVER_DEBUG_INVALID_RESPONSE"}
+        probe = ("import sys, summary_engine\n"
+                 "path = summary_engine._debug_response(sys.argv[1], 'kept')\n"
+                 "print(path is not None, 'hook' in sys.modules)")
+        result = subprocess.run([sys.executable, "-c", probe, str(self.state)], cwd=Path(engine.__file__).parent,
+                                env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.stdout.split(), ["True", "False"], result.stderr)
 
     def test_ttl_is_bounded(self):
         for value, expected in [("invalid", 604800), ("-5", 0), ("999999999", 2592000)]:
@@ -345,7 +371,10 @@ class EngineTests(unittest.TestCase):
     def test_claude_runner_is_isolated_and_thinking_follows_effort(self):
         blocked = {"ANTHROPIC_API_KEY": "secret", "ANTHROPIC_BASE_URL": "secret", "CLAUDECODE": "1",
                    "CLAUDE_CODE_ENTRYPOINT": "cli", "OPENAI_API_KEY": "secret",
-                   "SSH_AUTH_SOCK": "/synthetic/agent.sock", "GOOGLE_CLOUD_PROJECT": "secret"}
+                   "SSH_AUTH_SOCK": "/synthetic/agent.sock", "GOOGLE_CLOUD_PROJECT": "secret",
+                   "ANTHROPIC_AUTH_TOKEN": "secret", "AWS_ACCESS_KEY_ID": "secret",
+                   "AWS_SECRET_ACCESS_KEY": "secret", "GOOGLE_APPLICATION_CREDENTIALS": "/synthetic/key.json",
+                   "CLAUDE_CODE_USE_BEDROCK": "1"}
         popen, calls = self.popen(answer(), answer())
         with patch.dict(os.environ, {**blocked, "CLAUDE_CODE_PROMPT_CACHE_TTL": "1h"}), popen:
             payload, usage, incomplete, extra = engine._run_claude("SENTINEL-7f3", 30, "none")
@@ -361,10 +390,10 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(off["env"]["MAX_THINKING_TOKENS"], "0")
         self.assertNotIn("--effort", off["argv"])
         self.assertNotIn("MAX_THINKING_TOKENS", low["env"])
-        # One-shot sources are never re-read: short cache TTL, caller's 1h ignored.
-        self.assertEqual([off["env"]["CLAUDE_CODE_PROMPT_CACHE_TTL"], low["env"]["CLAUDE_CODE_PROMPT_CACHE_TTL"]],
-                         ["5m", "5m"])
-        self.assertNotIn("CLAUDE_CODE_PROMPT_CACHE_TTL", engine._environment())
+        # One-shot sources are never re-read: no prompt cache write, caller's 1h TTL dropped.
+        self.assertEqual([off["env"]["DISABLE_PROMPT_CACHING"], low["env"]["DISABLE_PROMPT_CACHING"]], ["1", "1"])
+        self.assertNotIn("CLAUDE_CODE_PROMPT_CACHE_TTL", off["env"])
+        self.assertNotIn("CLAUDE_CODE_PROMPT_CACHE_TTL", low["env"])
         self.assertEqual(low["argv"][low["argv"].index("--effort") + 1], "low")
         argv = off["argv"]
         self.assertEqual(argv[argv.index("--model") + 1], "sonnet")
@@ -383,6 +412,113 @@ class EngineTests(unittest.TestCase):
         for key in blocked:
             self.assertNotIn(key, off["env"])
         self.assertFalse(Path(off["cwd"]).exists())
+
+    def test_proxy_ca_and_config_dir_reach_the_helper(self):
+        passed = {"HTTPS_PROXY": "http://proxy.test:3128", "HTTP_PROXY": "http://proxy.test:3128",
+                  "NO_PROXY": "localhost", "ALL_PROXY": "socks5://proxy.test:1080",
+                  "https_proxy": "http://proxy.test:3128", "http_proxy": "http://proxy.test:3128",
+                  "no_proxy": "localhost", "all_proxy": "socks5://proxy.test:1080",
+                  "NODE_EXTRA_CA_CERTS": "/synthetic/ca.pem", "SSL_CERT_FILE": "/synthetic/ca.pem",
+                  "SSL_CERT_DIR": "/synthetic/certs", "REQUESTS_CA_BUNDLE": "/synthetic/ca.pem",
+                  "CLAUDE_CONFIG_DIR": "/synthetic/claude"}
+        popen, calls = self.popen(answer())
+        with patch.dict(os.environ, {**passed, "ANTHROPIC_API_KEY": "secret"}), popen:
+            engine._run_claude("SENTINEL-7f3", 30, "low")
+        env = calls[0]["env"]
+        self.assertEqual({key: env.get(key) for key in passed}, passed)
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+
+    def test_missing_cli_backs_off_without_starting_a_helper(self):
+        with patch.object(engine.shutil, "which", return_value=None), \
+                patch.object(engine.Path, "home", return_value=Path(self.temporary.name)):
+            first = self.summarize()
+        self.assertEqual(first["error"], "claude_cli_missing")
+        backoff = json.loads((self.state / engine.BACKOFF_FILE).read_text())
+        self.assertEqual(backoff["reason"], "claude_cli_missing")
+        self.assertAlmostEqual(backoff["until"], time.time() + engine.BACKOFF_SECONDS, delta=30)
+        self.assertEqual(stat.S_IMODE((self.state / engine.BACKOFF_FILE).stat().st_mode), 0o600)
+        # The CLI is back, but the backoff holds: no helper starts.
+        with patch.object(engine.subprocess, "Popen") as popen:
+            second = self.summarize(context="another call")
+        popen.assert_not_called()
+        self.assertEqual((second["status"], second["error"], second["usage_incomplete"]),
+                         ("error", "helper_backoff", False))
+        self.assertEqual(second["usage"]["total_tokens"], 0)
+
+    def test_backoff_serves_cache_hits_and_ends(self):
+        popen, calls = self.popen(answer(), answer())
+        with popen:
+            self.assertEqual(self.summarize()["status"], "summary")
+            (self.state / engine.BACKOFF_FILE).write_text(json.dumps(
+                {"until": time.time() + 600, "reason": "auth"}))
+            self.assertEqual(self.summarize()["status"], "cache_hit")
+            self.assertEqual(self.summarize(context="new")["error"], "helper_backoff")
+            self.assertEqual(len(calls), 1)
+            (self.state / engine.BACKOFF_FILE).write_text("not json")
+            self.assertEqual(self.summarize(context="new")["status"], "summary")
+        self.assertEqual(len(calls), 2)
+
+    def test_expired_or_implausible_backoff_is_ignored(self):
+        for entry in ({"until": time.time() - 1, "reason": "auth"},
+                      {"until": time.time() + 10 * engine.BACKOFF_SECONDS, "reason": "auth"},
+                      {"until": True, "reason": "auth"}, ["until"]):
+            with self.subTest(entry=entry):
+                self.state.mkdir(mode=0o700, exist_ok=True)
+                (self.state / engine.BACKOFF_FILE).write_text(json.dumps(entry))
+                result = self.summarize_answer(answer(), context=json.dumps(entry))
+                self.assertEqual(result["status"], "summary")
+
+    def test_login_and_credit_failures_back_off_capacity_does_not(self):
+        cases = [(claude_output(is_error=True, result="Not logged in · Please run /login"), "", "auth"),
+                 (claude_output(is_error=True, result="API Error: 401 authentication_error"), "", "auth"),
+                 (claude_output(is_error=True, result="Credit balance is too low"), "", "credit"),
+                 ("not json", "Error: 403 Forbidden", "auth"),
+                 (claude_output(is_error=True, result="API Error: 529 Overloaded"), "", None),
+                 (claude_output(is_error=True, result="Request timed out"), "", None),
+                 # A run that reported no error may quote the captured source.
+                 (claude_output(subtype="error_max_turns", result="the log says 401 unauthorized"), "", None)]
+        for stdout, stderr, reason in cases:
+            backoff = self.state / engine.BACKOFF_FILE
+            backoff.unlink(missing_ok=True)
+            popen, _ = self.popen(stdout, returncode=1 if stderr else 0, stderr=stderr)
+            with self.subTest(stdout=stdout[:80], stderr=stderr), popen:
+                result = self.summarize(context=stdout + stderr)
+                self.assertEqual(result["status"], "error")
+                self.assertNotEqual(result["error"], "helper_backoff")
+                if reason is None:
+                    self.assertFalse(backoff.exists())
+                else:
+                    self.assertEqual(json.loads(backoff.read_text())["reason"], reason)
+
+    def test_prune_cache_removes_old_entries_and_stale_temporaries(self):
+        cache = self.state / "cache"
+        cache.mkdir(parents=True)
+        now = time.time()
+        files = {cache / "old.json": now - 9 * 86400, cache / "new.json": now - 86400,
+                 cache / ".pending-old": now - 7200, cache / ".pending-new": now - 60,
+                 self.state / ".pending-old": now - 7200, self.state / "helper-backoff.json": now - 9 * 86400,
+                 cache / "notes.txt": now - 9 * 86400}
+        for path, mtime in files.items():
+            path.write_text("{}")
+            os.utime(path, (mtime, mtime))
+        (cache / "folder.json").mkdir()
+        os.utime(cache / "folder.json", (now - 9 * 86400,) * 2)
+        self.assertEqual(engine.prune_cache(self.state, 7 * 86400), 3)
+        left = sorted(str(path.relative_to(self.state)) for path in self.state.rglob("*"))
+        self.assertEqual(left, ["cache", "cache/.pending-new", "cache/folder.json",
+                                "cache/new.json", "cache/notes.txt", "helper-backoff.json"])
+        self.assertEqual(engine.prune_cache(Path(self.temporary.name) / "missing", 1), 0)
+
+    def test_prune_cache_ignores_a_linked_cache_folder(self):
+        target = Path(self.temporary.name) / "elsewhere"
+        target.mkdir()
+        old = target / "old.json"
+        old.write_text("{}")
+        os.utime(old, (time.time() - 9 * 86400,) * 2)
+        self.state.mkdir()
+        (self.state / "cache").symlink_to(target)
+        self.assertEqual(engine.prune_cache(self.state, 86400), 0)
+        self.assertTrue(old.exists())
 
     def test_token_file_reaches_child_env_only(self):
         token = "sk-ant-oat01-" + "A" * 40 + "_b-" + "c" * 40

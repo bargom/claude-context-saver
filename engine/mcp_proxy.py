@@ -10,9 +10,12 @@ from collections import OrderedDict
 import json
 import logging
 import os
+from pathlib import Path
 import signal
 import sys
 import uuid
+
+from common import text_blocks
 
 MAX_PENDING = 4096
 MAX_SUMMARIES = 8
@@ -107,17 +110,13 @@ class Compressor:
         if tracked is None or 'error' in message:
             return message
         result = message.get('result')
+        # Structured content (even an explicit null), resource links, images,
+        # audio, opaque blocks, per-block annotations or metadata and malformed
+        # content are contracts: they stay exact.
         if not isinstance(result, dict) or 'structuredContent' in result:
             return message
-        content = result.get('content')
-        # Resource links, images, audio, opaque blocks and malformed content stay exact.
-        if not isinstance(content, list) or not content or not all(
-            isinstance(block, dict) and block.get('type') == 'text' and isinstance(block.get('text'), str)
-            for block in content
-        ):
-            return message
-        # Per-block annotations/metadata are contracts; do not discard or combine them.
-        if any(set(block) - {'type', 'text'} for block in content):
+        text = text_blocks(result.get('content'), result.get('structuredContent'))
+        if text is None:
             return message
         name, arguments = tracked
         docs_search = self.server == 'openaiDeveloperDocs' and name == 'search_openai_docs'
@@ -125,7 +124,7 @@ class Compressor:
             from deterministic import docs_search_source
             # This projection is specific to the known navigation JSON envelope;
             # unknown/error result contracts are not handed to a helper either.
-            if result.get('isError') or docs_search_source('\n'.join(block['text'] for block in content)) is None:
+            if result.get('isError') or docs_search_source(text) is None:
                 return message
         local_only = self.active >= MAX_SUMMARIES
         if local_only and not docs_search:
@@ -156,6 +155,45 @@ class Compressor:
         finally:
             if not local_only:
                 self.active -= 1
+
+
+async def read_line(reader, source):
+    """The next line, or b'' at the end. A line over the reader limit is
+    dropped whole, with a note on stderr, and reading goes on after it."""
+    while True:
+        try:
+            return await reader.readuntil(b'\n')
+        except asyncio.IncompleteReadError as error:
+            return error.partial
+        except asyncio.LimitOverrunError:
+            # Never the content: only that a line was dropped and from where.
+            print(f'MCP compression proxy: dropped a {source} line over {MAX_LINE_BYTES} bytes',
+                  file=sys.stderr, flush=True)
+            await discard_line(reader)
+
+
+async def discard_line(reader):
+    """Drops buffered and incoming bytes up to and including the next newline."""
+    while True:
+        try:
+            await reader.readuntil(b'\n')
+            return
+        except asyncio.LimitOverrunError as error:
+            # error.consumed bytes are buffered and hold no newline.
+            await reader.readexactly(error.consumed)
+        except asyncio.IncompleteReadError:
+            return
+
+
+def protocol_version_of(message):
+    """The protocolVersion of an initialize result, or None."""
+    result = message.get('result')
+    version = result.get('protocolVersion') if isinstance(result, dict) else None
+    return version if isinstance(version, str) else None
+
+
+class SdkMissing(RuntimeError):
+    """The optional MCP SDK (engine/requirements-mcp.txt) is not installed."""
 
 
 async def stdin_reader():
@@ -214,7 +252,7 @@ async def stdio_bridge(command, compressor):
     results = set()
 
     async def requests():
-        while raw := await reader.readline():
+        while raw := await read_line(reader, 'client'):
             try:
                 original = json.loads(raw)
                 message = compressor.prepare_request(original)
@@ -228,7 +266,7 @@ async def stdio_bridge(command, compressor):
         child.stdin.close()
 
     async def responses():
-        while raw := await child.stdout.readline():
+        while raw := await read_line(child.stdout, 'server'):
             # Backpressure bounds queued data even when summaries are slow.
             if len(results) >= MAX_SUMMARIES:
                 await asyncio.wait(results, return_when=asyncio.FIRST_COMPLETED)
@@ -263,9 +301,13 @@ async def stdio_bridge(command, compressor):
 
 
 async def http_bridge(url, compressor):
-    from mcp.client.streamable_http import streamable_http_client
-    from mcp.shared.message import ClientMessageMetadata, SessionMessage
-    from mcp_types import jsonrpc_message_adapter
+    # Lazy: only this mode needs the optional SDK (setup --mcp).
+    try:
+        from mcp.client.streamable_http import streamable_http_client
+        from mcp.shared.message import ClientMessageMetadata, SessionMessage
+        from mcp_types import jsonrpc_message_adapter
+    except ImportError:
+        raise SdkMissing() from None
 
     # The SDK can log response bodies at DEBUG; suppress third-party diagnostics.
     logging.getLogger('mcp').setLevel(logging.CRITICAL)
@@ -280,7 +322,7 @@ async def http_bridge(url, compressor):
     try:
         async with streamable_http_client(url) as (incoming, outgoing):
             async def requests():
-                while raw := await reader.readline():
+                while raw := await read_line(reader, 'client'):
                     try:
                         message = json.loads(raw)
                         message = compressor.prepare_request(message)
@@ -308,8 +350,8 @@ async def http_bridge(url, compressor):
                     key = request_key(message.get('id'))
                     if key in initialization_ids and 'method' not in message:
                         initialization_ids.discard(key)
-                        version = message.get('result', {}).get('protocolVersion')
-                        if isinstance(version, str):
+                        version = protocol_version_of(message)
+                        if version:
                             protocol_version = version
                     if len(results) >= MAX_SUMMARIES:
                         await asyncio.wait(results, return_when=asyncio.FIRST_COMPLETED)
@@ -356,6 +398,10 @@ def main():
         return asyncio.run(serve(Compressor(args.server), stdio=args.stdio, http=args.http))
     except (KeyboardInterrupt, asyncio.CancelledError):
         return 0
+    except SdkMissing:
+        launcher = Path(__file__).resolve().parent.parent / 'bin' / 'context-saver'
+        print(f'MCP compression proxy: --http needs the MCP SDK; run: {launcher} setup --mcp', file=sys.stderr)
+        return 3
     except Exception as exc:
         # Never emit exception strings, request arguments, URLs or response bodies.
         print(f'MCP compression proxy stopped ({type(exc).__name__})', file=sys.stderr)

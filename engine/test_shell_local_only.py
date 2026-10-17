@@ -58,6 +58,22 @@ class ShellLocalOnlyTests(unittest.TestCase):
         candidates.assert_not_called()
         self.engine.assert_not_called()
 
+    def test_unknown_exit_code_is_not_a_failure(self):
+        # A Claude Code Bash event reports no exit code; only a known non-zero
+        # code or isError keeps the whole log.
+        text = jest_text()
+        unknown = self.event('npm test', text)
+        del unknown['tool_response']['exit_code']
+        result = hook.process(unknown, self.cfg, self.engine)
+        self.assertIn('300 passed, 300 total', result['stopReason'])
+        self.assertNotIn('exit_code=', result['stopReason'])
+        flagged = self.event('npm test', text)
+        flagged['tool_response'] = {'output': text, 'isError': True}
+        for event in (self.event('npm test', text, exit_code=1), flagged):
+            with self.subTest(response=event['tool_response'].keys()):
+                self.assertIsNone(hook.process(event, self.cfg, self.engine))
+        self.engine.assert_not_called()
+
     def test_discovery_helper_remains_available(self):
         self.cfg['deterministic_first'] = False
         event = {'hook_event_name': 'PostToolUse', 'tool_name': 'mcp__codebase__search_graph',
